@@ -72,3 +72,6 @@ The rules live in `RULES` and `TOKENOMICS` in `src/config.js`, and each one is m
   - a 1,000 QAK listing-vote threshold
   - a 2,000 RLUSD initial cap with +50% growth per on-time loan
   - a 30-day grace period before default
+
+## Deployment
+Pushes to `main` deploy to https://trustline-tan.vercel.app via Vercel Git integration. `VITE_XAMAN_API_KEY` is set in Vercel project settings, not in the repo.
