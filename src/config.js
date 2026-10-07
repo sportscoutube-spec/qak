@@ -13,6 +13,11 @@ export const RLUSD = {
   testnetIssuer: "rQhWct2fv4Vc4KRjRgMrxa8xPN9Zx9iLKV",
 };
 export const ASSET = "RLUSD";
+// QAK token on XRPL mainnet. Issuer status (flags, blackhole, obligations, escrows) is read live; never hardcoded.
+export const QAK_ISSUER = "r98RkKUasH5vA3mshD5Bi3eAVHCYwziY9M";
+export const QAK_CURRENCY = "QAK";
+export const QAK_EXPLORER = "https://livenet.xrpl.org/accounts/" + QAK_ISSUER;
+export const LEDGER_RPC = "https://xrplcluster.com/"; // mainnet; already in CSP connect-src
 export const AMENDMENTS = {
   checked: "2026-10-07 10:33 EEST",
   method: "ledger_entry Amendments object (validated ledger) on public servers",

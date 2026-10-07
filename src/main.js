@@ -1,4 +1,5 @@
-import { CONFIG, RLUSD, ASSET, AMENDMENTS, GATED_TXS, RULES, TOKENOMICS, LIMITS } from "./config.js";
+import { CONFIG, RLUSD, ASSET, AMENDMENTS, GATED_TXS, RULES, TOKENOMICS, LIMITS, QAK_ISSUER, QAK_CURRENCY, QAK_EXPLORER } from "./config.js";
+import * as L from "./ledger.js";
 import * as S from "./state.js";
 import * as X from "./xaman.js";
 const esc=(v)=>String(v??"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
@@ -7,6 +8,34 @@ const KEY="qak-v3"; let st = load() || S.seed();
 const save=()=>localStorage.setItem(KEY,JSON.stringify(st)); const $=(h)=>document.getElementById("app").innerHTML=h;
 const me=()=>X.wallet.account||"guest"; const tag=(s)=>`<span class="tag s-${esc(s)}">${esc(s)}</span>`; const sample=(p)=>p.sample?` <span class="tag sample">Sample shop</span>`:"";
 const pct=(bps)=>(bps/100).toFixed(2);
+// ---- live ledger reads (mainnet, read-only) ----
+const LG={ issuer:null, issuerErr:null, issuerLoading:false, issuerAt:0, bal:null, balErr:null, balLoading:false };
+const athens=(d)=>d?new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Athens",year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:false,timeZoneName:"short"}).format(d):"none";
+function loadIssuer(force){ if(LG.issuerLoading||(!force&&(LG.issuer||LG.issuerErr)&&Date.now()-LG.issuerAt<60000)) return; LG.issuerLoading=true; LG.issuerErr=null;
+  L.issuerStatus().then(x=>{ LG.issuer=x; LG.issuerAt=Date.now(); }).catch(e=>{ LG.issuerErr=e.message||"unavailable"; LG.issuerAt=Date.now(); }).finally(()=>{ LG.issuerLoading=false; route(); }); }
+function loadBalance(){ const w=X.wallet; if(w.mode!=="xaman"||!w.account){ LG.bal=null; LG.balErr=null; return; }
+  if(LG.balLoading||(LG.bal&&LG.bal.account===w.account)) return; LG.balLoading=true; LG.balErr=null;
+  L.qakBalance(w.account).then(b=>{ LG.bal=b; }).catch(e=>{ LG.bal=null; LG.balErr=e.message||"unavailable"; }).finally(()=>{ LG.balLoading=false; route(); }); }
+// Ledger QAK of the connected real account; preview/unconnected/no line = 0.
+const ledgerQak=()=>X.wallet.mode==="xaman"&&LG.bal&&LG.bal.account===X.wallet.account?LG.bal.balance:0;
+const ledgerVerified=()=>X.wallet.mode==="xaman"&&!!LG.bal&&LG.bal.account===X.wallet.account;
+const balText=()=>{ const w=X.wallet; if(!w.account) return "0 QAK (not connected)"; if(w.mode!=="xaman") return "0 QAK (preview account has no ledger balance)";
+  if(LG.balLoading&&!LG.bal) return "reading ledger…"; if(LG.balErr) return "0 QAK (ledger read unavailable: "+esc(LG.balErr)+")";
+  if(!LG.bal) return "reading ledger…"; return LG.bal.hasLine?`${n(LG.bal.balance)} QAK${LG.bal.authorized?"":" (trust line not yet authorized by issuer)"}`:"0 QAK (no QAK trust line)"; };
+const myFeeBps=()=>S.feeBps(ledgerQak());
+const poolFee=(p)=>{ if(p.account&&ledgerVerified()&&p.account===X.wallet.account) return [S.feeBps(ledgerQak()),"(QAK balance read from ledger)"];
+  return [S.poolFeeBps(p), p.holdingVerified?"(QAK balance read from ledger at application)":"(QAK holding not verified on ledger)"]; };
+const qakLink=`<a href="${esc(QAK_EXPLORER)}" target="_blank" rel="noopener noreferrer">${esc(QAK_ISSUER)}</a>`;
+const qakRow=`<tr><td>QAK token</td><td>currency code ${esc(QAK_CURRENCY)}, issuer ${qakLink}</td></tr>`;
+const trustNote=`<p class="note">To hold QAK, an account sets a trust line to issuer ${qakLink} for currency code ${esc(QAK_CURRENCY)}. If the issuer requires authorization (see live flags), the line works only after the issuer authorizes it. This app never sends a trust line or any other transaction.</p>`;
+function issuerCard(){ if(LG.issuerErr&&!LG.issuer) return `<div class="card"><h3>Live issuer status</h3><p>Live issuer status unavailable right now (${esc(LG.issuerErr)}). Check the issuer on ${qakLink}.</p><button id="reissuer">Retry</button></div>`;
+  const x=LG.issuer; if(!x) return `<div class="card"><h3>Live issuer status</h3><p>Reading the issuer from the XRP Ledger…</p></div>`;
+  return `<div class="card"><h3>Live issuer status</h3><table>${qakRow}
+   <tr><td>Blackholed</td><td class="${x.blackholed?"on":"off"}">${x.blackholed?"yes":"no"} (master key ${x.masterDisabled?"disabled":"enabled"}; regular key ${esc(x.regularKey||"none")}; signer lists ${n(x.signerListCount)})</td></tr>
+   <tr><td>Circulating (issuer obligations)</td><td>${esc(Number(x.obligations).toLocaleString(undefined,{maximumFractionDigits:2}))} QAK</td></tr>
+   <tr><td>Escrowed</td><td>${x.escrows.length?`${n(x.escrowedTotal)} QAK in ${n(x.escrows.length)} escrow(s)<ul>${x.escrows.map(e=>`<li>${esc(Number(e.value).toLocaleString())} QAK to ${esc(e.destination)}, unlocks (FinishAfter) ${esc(athens(e.finishAfter))}${e.cancelAfter?", cancel after "+esc(athens(e.cancelAfter)):""}</li>`).join("")}</ul>`:"none"}</td></tr>
+   <tr><td>Flags</td><td>${esc(x.flags.join(", ")||"none")}</td></tr></table>
+   <p class="note">Read live from the XRP Ledger (xrplcluster.com, validated ledger ${esc(x.ledgerIndex??"?")}) at ${esc(athens(x.fetchedAt))}. <button id="reissuer" class="sec">Refresh</button></p></div>`; }
 const rlusdRow=`<tr><td>Asset</td><td>${ASSET} (currency code ${RLUSD.currencyHex}), mainnet issuer ${RLUSD.mainnetIssuer}</td></tr>`; const n=(x)=>Number(x).toLocaleString();
 const gate=`<p class="off">Waiting on amendment: XLS-65/66 transactions are feature-flagged OFF (${CONFIG.enableVaultLending?"flag set, but mainnet still not enabled; devnet-only":"flag off"}). Mainnet sends: OFF.</p>`;
 const act=(f)=>{ try{ f(); save(); }catch(e){ alert(e.message);} route(); };
@@ -31,7 +60,8 @@ const pages={
    <label>Draw cap (${ASSET}; first-time shops max ${n(RULES.INITIAL_CAP_RLUSD)})<input name="drawCap" type="number" min="1" step="1" max="${RULES.INITIAL_CAP_RLUSD}" value="${RULES.INITIAL_CAP_RLUSD}" required></label>
    <label>Interest rate % APR (${LIMITS.RATE_MIN_PCT}-${LIMITS.RATE_MAX_PCT})<input name="ratePct" type="number" step="any" min="${LIMITS.RATE_MIN_PCT}" max="${LIMITS.RATE_MAX_PCT}" value="10" required></label><label>Term (days, ${LIMITS.TERM_MIN_DAYS}-${LIMITS.TERM_MAX_DAYS})<input name="termDays" type="number" step="1" min="${LIMITS.TERM_MIN_DAYS}" max="${LIMITS.TERM_MAX_DAYS}" value="60" required></label>
    <label>QAK listing lock (must be ${n(RULES.LISTING_LOCK_QAK)})<input name="listingLock" type="number" step="1" value="${RULES.LISTING_LOCK_QAK}" required></label>
-   <label>QAK held by the shop account (self-declared; not verified until the ledger balance read is wired, so the fee stays ${pct(RULES.PROTOCOL_FEE_BPS)}%)<input name="shopHoldingQak" type="number" step="1" min="1" placeholder="optional"></label>
+   <label>QAK balance (ledger)<input id="ledgerqak" type="text" readonly value="${balText().replace(/"/g,"&quot;")}"></label>
+   <p class="note">Read from the XRP Ledger for the connected Xaman account (trust line to ${qakLink}, currency ${esc(QAK_CURRENCY)}). Fee tier: ${pct(myFeeBps())}% of interest paid. The listing lock must be covered by this balance. It is an app rule; no transaction is sent.</p>
    <p id="minfl" class="warn"></p><p id="err" class="off" role="alert"></p>
    <button>Submit application</button></form><p>After you submit, the application is reviewed. QAK holders vote on the listing and the cap. Status starts at ${tag("applied")}.</p>`,
   whitepaper: ()=>`<h1>QAK Whitepaper</h1><p><a class="btn" href="/qak-whitepaper.pdf" download>Download PDF</a> <a class="btn sec" href="/qak-whitepaper.pdf" target="_blank" rel="noopener">Open in new tab</a></p>
@@ -44,7 +74,7 @@ const pages={
    return `<h1>${esc(p.shop)} ${tag(p.status)}${sample(p)}</h1><div class="card"><table>
    <tr><td>City</td><td>${esc(p.city)}</td></tr><tr><td>Purpose</td><td>${esc(p.purpose)}</td></tr>${rlusdRow}${p.account?`<tr><td>Applicant account</td><td>${esc(p.account)}</td></tr>`:""}<tr><td>Draw cap</td><td>${n(p.drawCap)} ${ASSET}</td></tr>
    <tr><td>Rate / term</td><td>${n(p.ratePct)}% APR / ${n(p.termDays)} days</td></tr><tr><td>Deposited / drawn / repaid</td><td>${n(p.totalDeposits)} / ${n(p.drawn)} / ${n(p.repaid)} (owed ${n(S.owedOf(p))})</td></tr>
-   <tr><td>Listing lock</td><td>${n(p.listingLock.qak)} QAK</td></tr><tr><td>First-loss locked</td><td>${n(S.firstLossQak(p))} QAK from ${p.firstLoss.length} holder(s); valued at the draw snapshot${p.drawSnapshotPrice?" ("+n(p.drawSnapshotPrice)+" "+ASSET+")":""}. The cushion is only what was locked.</td></tr><tr><td>Protocol fee</td><td>${pct(S.poolFeeBps(p))}% of interest paid${p.holdingVerified?"":" (QAK holding not verified on ledger)"}</td></tr><tr><td>Shop max cap now</td><td>${n(S.maxCap(p))} ${ASSET} (${p.onTimeLoans||0} on-time loans)</td></tr>
+   ${qakRow}<tr><td>Listing lock</td><td>${n(p.listingLock.qak)} QAK</td></tr><tr><td>First-loss locked</td><td>${n(S.firstLossQak(p))} QAK from ${p.firstLoss.length} holder(s); valued at the draw snapshot${p.drawSnapshotPrice?" ("+n(p.drawSnapshotPrice)+" "+ASSET+")":""}. The cushion is only what was locked.</td></tr><tr><td>Protocol fee</td><td>${pct(poolFee(p)[0])}% of interest paid ${poolFee(p)[1]}</td></tr><tr><td>Shop max cap now</td><td>${n(S.maxCap(p))} ${ASSET} (${p.onTimeLoans||0} on-time loans)</td></tr>
    <tr><td>Next eligible cap</td><td>${p.status==="defaulted"?"none":n(S.nextCap(p))+" "+ASSET+" if this loan is repaid fully on time"+(p.hadLate?" (a late payment means growth resets to "+n(RULES.INITIAL_CAP_RLUSD)+")":"")}</td></tr>
    <tr><td>Draws</td><td>${p.frozen?`<span class="off">FROZEN: ${n(p.overdue)} ${ASSET} overdue, ${S.daysLate(p)} days late (default possible after ${RULES.DEFAULT_GRACE_DAYS})</span>`:'<span class="on">not frozen</span>'}</td></tr>
    <tr><td>Votes (1 QAK = 1 vote)</td><td>listing: yes ${n(p.votes.yes)} / no ${n(p.votes.no)}</td></tr>
@@ -57,8 +87,9 @@ const pages={
    ${a("repay","Repay 1,000")}${gate}
    <ul>${p.log.map(l=>`<li>${esc(l)}</li>`).join("")}</ul></div>`; },
   lend: ()=>`<h1>Lender panel</h1>
-   <div class="card">Wallet: ${esc(X.wallet.account||"not connected")}<br><button disabled>Deposit: Opens when XRPL vaults go live</button><button disabled>Withdraw: Opens when XRPL vaults go live</button></div>
+   <div class="card">Wallet: ${esc(X.wallet.account||"not connected")}<br>QAK balance (ledger): ${balText()} · fee tier ${pct(myFeeBps())}%<br><button disabled>Deposit: Opens when XRPL vaults go live</button><button disabled>Withdraw: Opens when XRPL vaults go live</button></div>
    <div class="card"><h3>Lent asset</h3><table>${rlusdRow}<tr><td>Testnet issuer</td><td>${RLUSD.testnetIssuer}</td></tr></table></div>
+   <div class="card"><h3>QAK (access token, not lent)</h3><table>${qakRow}</table>${trustNote}</div>
    <div class="card"><h3>Your receipts</h3><table><tr><th>Pool</th><th>Deposited</th><th>Share</th><th>Status</th></tr>
    ${st.pools.filter(p=>p.deposits[me()]).map(p=>`<tr><td>${esc(p.shop)}</td><td>${n(p.deposits[me()])}</td><td>${(S.shares(p,me())*100).toFixed(1)}%</td><td>${tag(p.status)}</td></tr>`).join("")||"<tr><td colspan=4>none</td></tr>"}</table></div>
    <div class="card"><h3>Lender queue (ordered by locked QAK; does not reserve a fill)</h3><button disabled>Join queue: Opens when XRPL vaults go live</button>
@@ -72,6 +103,7 @@ const pages={
      ["Vote","One QAK is one vote, on listing and on draw cap only. A vote cannot move another pool's deposits."],
      ["Cover pot",`Half of protocol fees, plus seized stake, goes to the pot. The pot pays the next default only up to its balance, then stops. Currently ${n(st.pot.rlusd.toFixed(2))} ${ASSET} + ${n(st.pot.qak)} QAK.`]]
      .map(([h,b])=>`<div class="card"><h3>${h}</h3>${b}</div>`).join("")}</div>
+   ${issuerCard()}${trustNote}
    <div class="card">The QAK issuer is blackholed after launch, so no more QAK can be minted and the issuer cannot seize a balance on the ledger. "Seized" here is an app rule applied against a published balance. It is not a ledger clawback, and nothing is burned. <b>QAK has no buy or sell tax.</b> Buys outside the app are untaxed. QAK is never the lent asset and never the lender receipt.</div>
    <h2>Tokenomics</h2><div class="card"><p>QAK is created on ${K.venue} in ${K.mint}. Supply is <b>${n(K.supply)}</b>, fixed. Half is sold into the opening pool. The other half is the issuer allocation, earmarked before launch.</p>
    <table><tr><th>Bucket</th><th>Of supply</th><th>Tokens</th><th>Use</th></tr>${K.buckets.map(b=>`<tr><td>${b.name}</td><td>${b.pct}%</td><td>${n(b.tokens)}</td><td>${b.use}</td></tr>`).join("")}</table></div>
@@ -81,7 +113,8 @@ const pages={
    ${AMENDMENTS.items.map(a=>`<tr><td>${a.name} (${a.xls})</td><td class="off">${a.mainnet}</td><td class="off">${a.testnet}</td><td class="on">${a.devnet}</td></tr>`).join("")}</table>
    <p><button id="recheck">Re-check live now</button> <span id="live"></span></p>
    <div class="card"><h3>Gated transactions (OFF)</h3>${GATED_TXS.join(", ")}<br>Flag VITE_ENABLE_VAULT_LENDING=${CONFIG.enableVaultLending}. A devnet path is possible because both amendments are enabled there, but it is not wired up in v1. Mainnet sends are hard-off.</div>
-   <div class="card">RLUSD mainnet issuer ${RLUSD.mainnetIssuer}, testnet issuer ${RLUSD.testnetIssuer} (docs.ripple.com).</div>`,
+   <div class="card">RLUSD mainnet issuer ${RLUSD.mainnetIssuer}, testnet issuer ${RLUSD.testnetIssuer} (docs.ripple.com).</div>
+   <h2>QAK issuer</h2>${issuerCard()}`,
 };
 const AMEND_IDX="7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4";
 const viaHttp=async(url)=>{ const r=await (await fetch(url,{method:"POST",headers:{"content-type":"application/json"},
@@ -107,10 +140,11 @@ const notFound=()=>`<h1>404: page not found</h1><p>There is no page at this addr
 const dec=(x)=>{ try{ return decodeURIComponent(x||""); }catch{ return ""; } };
 function route(){ const [pg,arg]=location.hash.replace(/^#\/?/,"").split("/"); $(Object.hasOwn(pages,pg)?pages[pg](dec(arg)):notFound());
   document.getElementById("recheck")?.addEventListener("click",liveCheck);
+  if(pg==="trust"||pg==="status"){ loadIssuer(false); document.getElementById("reissuer")?.addEventListener("click",()=>loadIssuer(true)); }
   const f=document.getElementById("f"); if(f){ const upd=()=>{ const c=Number(f.drawCap.value)||0; document.getElementById("minfl").textContent=`Listing needs a ${n(RULES.LISTING_LOCK_QAK)} QAK lock. Cap at most ${n(RULES.INITIAL_CAP_RLUSD)} ${ASSET} for a first-time shop. Before the draw, holders must lock first-loss QAK worth at least ${RULES.FIRST_LOSS_PCT*100}% of ${n(c)} ${ASSET} (${n(c*RULES.FIRST_LOSS_PCT)} ${ASSET}), valued at the draw snapshot. QAK has no price before mint.`; };
     f.drawCap.addEventListener("input",upd); upd(); }
   if(f) f.onsubmit=(e)=>{ e.preventDefault(); const err=document.getElementById("err");
-    try{ const p=S.apply(st,{...Object.fromEntries(new FormData(f)),account:X.wallet.account}); save(); location.hash="#/pool/"+encodeURIComponent(p.id); }
+    try{ const p=S.apply(st,{...Object.fromEntries(new FormData(f)),account:X.wallet.account,ledgerQak:ledgerQak(),ledgerVerified:ledgerVerified()}); save(); location.hash="#/pool/"+encodeURIComponent(p.id); }
     catch(x){ err.textContent=x.message; } }; }
-window.addEventListener("hashchange",route); window.addEventListener("wallet",()=>{walletUI();route();});
+window.addEventListener("hashchange",route); window.addEventListener("wallet",()=>{ loadBalance(); walletUI(); route(); });
 walletUI(); route(); X.init();

@@ -53,9 +53,11 @@ export function apply(s,f){ reqAccount(f.account); const shop=cleanName(f.shop,"
   const term=num(f.termDays,"term"); req(Number.isInteger(term)&&term>=L.TERM_MIN_DAYS&&term<=L.TERM_MAX_DAYS,`term must be a whole number of days, ${L.TERM_MIN_DAYS}..${L.TERM_MAX_DAYS}`);
   const lock=num(f.listingLock,"listing lock"); req(isQak(lock),`QAK amounts must be whole numbers 1..${R.TOTAL_SUPPLY_QAK.toLocaleString()}`);
   req(lock===R.LISTING_LOCK_QAK,`listing lock must be ${R.LISTING_LOCK_QAK.toLocaleString()} QAK`);
-  let held=null; if(f.shopHoldingQak!==undefined&&String(f.shopHoldingQak).trim()!==""){ held=Number(f.shopHoldingQak); req(isQak(held),`QAK held must be a whole number 1..${R.TOTAL_SUPPLY_QAK.toLocaleString()}`); }
+  // QAK held comes from the ledger (account_lines), passed in by the app, never from the form. Preview/unconnected = 0.
+  const held=Number(f.ledgerQak)||0; req(held>=0&&held<=R.TOTAL_SUPPLY_QAK,"bad ledger balance");
+  req(lock<=held,`listing lock (${lock.toLocaleString()} QAK) must be covered by your QAK balance (ledger): ${held.toLocaleString()} QAK`);
   const p={...blank(),id:newId(),shop,city,purpose:f.purpose,drawCap:cap,ratePct:rate,termDays:term,status:"applied",onTimeLoans:0,
-    account:f.account,listingLock:{who:f.account,qak:lock},shopHoldingQak:held,holdingVerified:false,sample:false,log:["applied by "+f.account]};
+    account:f.account,listingLock:{who:f.account,qak:lock},shopHoldingQak:held,holdingVerified:f.ledgerVerified===true,sample:false,log:["applied by "+f.account]};
   s.pools.push(p); return p; }
 
 // Load-time validation of stored state (localStorage is untrusted). Bad pools are dropped; strings are type/length checked.

@@ -3,7 +3,7 @@ const ok=(n)=>console.log("ok -",n); const P=0.01; // test snapshot price only
 assert.equal(K.buckets.reduce((t,b)=>t+b.tokens,0),R.TOTAL_SUPPLY_QAK); assert.equal(K.escrow.reduce((t,b)=>t+b.tokens,0),500_000_000); ok("tokenomics sums");
 { const s=S.seed(); for(const p of s.pools){ assert(p.drawCap<=S.maxCap(p)); assert(p.drawCap<=R.MAX_CAP_RLUSD); assert.equal(p.listingLock.qak,250000); }
   for(const p of s.pools.filter(p=>p.drawn)) assert(S.firstLossQak(p)>0); ok("seed respects rules"); }
-{ const s=S.seed(); const f={shop:"X",city:"Y",purpose:"stock",drawCap:2000,ratePct:10,termDays:60,listingLock:249999,account:"rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY"};
+{ const s=S.seed(); const f={shop:"X",city:"Y",purpose:"stock",drawCap:2000,ratePct:10,termDays:60,listingLock:249999,account:"rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY",ledgerQak:300000,ledgerVerified:true};
   assert.throws(()=>S.apply(s,f),/listing lock/); assert.throws(()=>S.apply(s,{...f,listingLock:250000,drawCap:2001}),/cap/); S.apply(s,{...f,listingLock:250000}); ok("listing lock 250,000 + cap"); }
 { assert.equal(S.feeBps(99999),100); assert.equal(S.feeBps(100000),75); const s=S.seed(); const p=s.pools[0];
   S.deposit(s,"p1","me",3000); assert.throws(()=>S.draw(s,"p1"),/snapshot/); assert.equal(S.minFirstLossQak(3000,P),45000);
@@ -25,14 +25,15 @@ ok("whitepaper worked example (400 / 150) + isolation + no burn");
   S.missPayment(s,"p1",400,0); const r=S.declareDefault(s,"p1",P,30); assert.equal(r.fromPot,100); assert.equal(r.lenderLoss,300); assert.equal(s.pot.rlusd,0); ok("pot pays only up to its balance"); }
 { const s=S.seed(); S.voteCap(s,"p4",1500,5000,"rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY"); S.vote(s,"p4",true,1200,"rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY"); assert.equal(s.pools[3].status,"listed"); assert.equal(s.pools[3].drawCap,1500);
   assert.throws(()=>S.transition(s,"p4","repaid")); ok("1 QAK = 1 vote on listing and cap"); }
-{ const s=S.seed(); const A="rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY", f={shop:" Shop ",city:"Athens",purpose:"stock",drawCap:1500,ratePct:10,termDays:60,listingLock:250000,account:A};
+{ const s=S.seed(); const A="rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY", f={shop:" Shop ",city:"Athens",purpose:"stock",drawCap:1500,ratePct:10,termDays:60,listingLock:250000,account:A,ledgerQak:250000,ledgerVerified:true};
   assert.throws(()=>S.apply(s,{...f,account:undefined}),/connect/); assert.throws(()=>S.apply(s,{...f,account:"guest"}),/connect/);
   for(const [k,v,re] of [["shop","  ",/required/],["shop","x".repeat(61),/max 60/],["city","",/required/],["ratePct",-1,/rate/],["ratePct",36.5,/rate/],["ratePct","",/required/],["ratePct","abc",/number/],
     ["termDays",6,/term/],["termDays",181,/term/],["termDays",30.5,/term/],["drawCap",0,/cap/],["drawCap",-5,/cap/],["drawCap",1e12,/cap/],["drawCap","abc",/number/],["drawCap",1.5,/cap/],
-    ["listingLock",1e15,/whole numbers/],["listingLock",250001,/listing lock/],["shopHoldingQak",-3,/QAK held/],["shopHoldingQak",2e9,/QAK held/],["purpose","x",/purpose/]])
+    ["listingLock",1e15,/whole numbers/],["listingLock",250001,/listing lock/],["ledgerQak",249999,/covered by your QAK balance/],["ledgerQak",0,/covered/],["ledgerQak",undefined,/covered/],["purpose","x",/purpose/]])
     assert.throws(()=>S.apply(s,{...f,[k]:v}),re,k+"="+v);
   const p=S.apply(s,{...f,ratePct:0,termDays:7}); assert.equal(p.ratePct,0); assert.equal(p.termDays,7); assert.equal(p.shop,"Shop"); assert.equal(p.account,A);
-  assert.equal(p.shopHoldingQak,null); assert.equal(S.poolFeeBps(p),100); const q=S.apply(s,{...f,shopHoldingQak:200000}); assert.equal(S.poolFeeBps(q),100,"self-declared holding gets no discount");
+  assert.equal(p.shopHoldingQak,250000); assert.equal(S.poolFeeBps(p),75,"ledger-verified >=100k -> 0.75%"); const q=S.apply(s,{...f,ledgerQak:250000,ledgerVerified:false,shopHoldingQak:9e8});
+  assert.equal(S.poolFeeBps(q),100,"unverified -> 1.00%"); assert.equal(q.shopHoldingQak,250000,"form field ignored");
   assert.notEqual(p.id,q.id); assert(/^p_[0-9a-f-]{36}$/.test(p.id)); assert(s.pools.slice(0,4).every(x=>x.sample)&&!p.sample);
   assert.throws(()=>S.vote(s,"p4",true,10),/connect/); assert.throws(()=>S.lockFirstLoss(s,"p4","guest",10),/connect/); assert.throws(()=>S.lockFirstLoss(s,"p4",A,1.5),/whole/);
   assert.throws(()=>S.vote(s,"p4",true,2e9,A),/QAK weight/); ok("apply/vote/lock validation + account required + honest fee + uuid ids"); }

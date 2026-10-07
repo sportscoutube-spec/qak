@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --port 4173",
-    "test": "node src/state.test.js"
+    "test": "node src/state.test.js && node src/ledger.test.js"
   },
   "keywords": [],
   "author": "",
