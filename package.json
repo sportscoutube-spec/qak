@@ -1,0 +1,23 @@
+{
+  "name": "trustline",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173",
+    "test": "node src/state.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "xumm": "^1.8.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.3"
+  },
+  "type": "module",
+  "private": true
+}
