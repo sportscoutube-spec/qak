@@ -11,7 +11,7 @@ export const hasKey = () => /^[0-9a-f-]{36}$/i.test(CONFIG.xamanApiKey) && !/^0{
 export const XAMAN_SUPPORT = {
   forceNetwork: "DEVNET is a key in Xaman's network rails, so a payload can set options.force_network: \"DEVNET\".",
   txTypes: "Not verified. Xaman's docs: transaction types for amendments that are not voted in on mainnet may be unavailable. If Xaman rejects a payload, the error is shown.",
-  counterparty: "Not available. Xaman does not document signing a LoanSet CounterpartySignature, so the shop's counter-signature cannot be collected in this app.",
+  counterparty: "Not available. Xaman does not document signing a LoanSet CounterpartySignature, so the shop's counter-signature cannot be collected in this app. Note: with fixCleanup3_4_0 enabled (devnet), the counter-signature must use the counterparty hash prefix \"CPT\\0\" (0x43505400), not the normal \"STX\\0\"; a plain transaction signature is rejected as a bad signature (seen in the devnet test run).",
 };
 
 async function load() {

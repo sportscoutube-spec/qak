@@ -15,7 +15,8 @@ Snapshot 2026-10-08 09:13 EEST: mainnet and testnet have none enabled; devnet ha
 - **Mainnet:** hard-off in `src/config.js` (`NETWORKS.mainnet.vaultLending = false`). No env switch turns it on. No mainnet deposits.
 - **Testnet:** status only.
 - **Devnet:** may call the real transactions once all three amendments read enabled and a test issuer is configured.
-  RLUSD does not exist on devnet, so the asset is a labelled test IOU from `VITE_DEVNET_TEST_ISSUER`. Unset, devnet actions stay disabled.
+  RLUSD does not exist on devnet, so the asset is DUSD, a labelled devnet test token (not RLUSD, no value; currency code fixed in `src/config.js`)
+  issued by `VITE_DEVNET_TEST_ISSUER`. Unset, devnet actions stay disabled. A completed end-to-end devnet run is listed on the Status page.
 
 ## Run
 ```

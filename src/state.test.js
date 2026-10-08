@@ -80,6 +80,8 @@ ok("tokenomics, team, roadmap");
   assert(!S.networkGate("testnet", all).ok);
   const noIss = S.networkGate("devnet", all, { issuer: "" }); assert(!noIss.ok); assert.match(noIss.reasons.join(), /RLUSD does not exist on devnet/);
   assert.equal(NETWORKS.devnet.asset.issuer, "", "no devnet issuer invented"); assert.match(NETWORKS.devnet.asset.placeholder, /PLACEHOLDER/);
+  assert.notEqual(NETWORKS.devnet.asset.currency, NETWORKS.mainnet.asset.currency, "devnet test token must not use the RLUSD code"); assert.equal(Buffer.from(NETWORKS.devnet.asset.currency.slice(0, 8), "hex").toString(), "DUSD");
+  assert.match(NETWORKS.devnet.asset.label, /test token/); assert.match(NETWORKS.devnet.asset.label, /not RLUSD/); assert.equal(NETWORKS.mainnet.vaultLending, false, "mainnet hard-off");
   ok("gating: all three amendments required, mainnet hard-off, devnet needs a test issuer"); }
 
 // QAK fee cut at broker creation

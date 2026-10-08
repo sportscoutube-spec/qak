@@ -1,4 +1,4 @@
-import { PRODUCT, RULES, LIMITS, SPEC, FLAGS, AMENDMENTS, NETWORKS, GATED_TXS, TOKENOMICS, TEAM, ROADMAP, QAK_ISSUER, QAK_CURRENCY, QAK_EXPLORER, ASSET } from "./config.js";
+import { PRODUCT, RULES, LIMITS, SPEC, FLAGS, AMENDMENTS, NETWORKS, GATED_TXS, TOKENOMICS, TEAM, ROADMAP, QAK_ISSUER, QAK_CURRENCY, QAK_EXPLORER, ASSET, DEVNET_TEST_RUN } from "./config.js";
 import * as L from "./ledger.js";
 import * as S from "./state.js";
 import * as P from "./payloads.js";
@@ -17,6 +17,8 @@ const save = () => localStorage.setItem(KEY, JSON.stringify(st));
 const $ = (h) => (document.getElementById("app").innerHTML = h);
 const NC = `<span class="muted">not created yet</span>`;
 const sample = (p) => (p.sample ? ` <span class="tag sample">Sample shop</span>` : "");
+// Unit shown for a pool: RLUSD on mainnet/testnet, the DUSD devnet test token on devnet (never called RLUSD there).
+const unitOf = (p) => NETWORKS[p.network]?.asset.unit || ASSET;
 const stageTag = (s) => `<span class="tag s-${esc(s)}">${esc(s)}</span>`;
 
 // ---------- live reads ----------
@@ -54,7 +56,7 @@ const risks = `<ul class="risks">
  <li><b>No on-chain collateral.</b> Loans are unsecured on the ledger. The XLS-66 security section says the protocol "does not offer on-chain algorithmic protection against default".</li>
  <li><b>No liquidation.</b> On default the ledger moves at most min(DebtTotal × CoverRateMinimum × CoverRateLiquidation, DefaultAmount, CoverAvailable) from cover into the vault. The rest is written down on that vault, so a miss stays in that shop.</li>
  <li><b>Lock-up.</b> Withdrawals are blocked from SubscriptionDate to RedemptionDate. Redemption opens on RedemptionDate even if a loan is late.</li>
- <li><b>Interest booked early.</b> At LoanSet the vault's AssetsTotal rises by the expected interest, before any interest is paid.</li>
+ <li><b>Interest booking.</b> The XLS-66 text books the expected interest into AssetsTotal (and DebtTotal) at LoanSet. On devnet with LendingProtocolV1_1 the ledger books interest only as payments arrive (cash basis; seen in the devnet test run). The app still counts expected interest toward the caps and the cover, which is the stricter bound.</li>
  <li>The code is not audited.</li></ul>`;
 const pseudoNote = `The vault's pseudo-account holds the RLUSD. It cannot receive ordinary payments, so money reaches lenders only through VaultDeposit, LoanPay and, on default, cover moved by LoanManage.`;
 
@@ -70,12 +72,12 @@ function actions(p) {
   const list = [];
   const add = (key, label, who, extra, build) => { let tx = null, err = null; try { tx = build(); } catch (e) { err = e.message; }
     list.push({ key, label, who, reasons: [...base, ...extra, ...(err && !extra.length ? [err] : [])], tx, err }); };
-  add("VaultCreate", "1. VaultCreate (closed-ended, RLUSD)", "operator", [...listed, ...(p.ledger.VaultID ? ["Vault already created for this shop."] : [])],
+  add("VaultCreate", `1. VaultCreate (closed-ended, ${unitOf(p)})`, "operator", [...listed, ...(p.ledger.VaultID ? ["Vault already created for this shop."] : [])],
     () => P.vaultCreate({ asset, AssetsMaximum: p.capRlusd, ...S.planDates(p.plan, now), now }));
   add("LoanBrokerSet", "2. LoanBrokerSet on this VaultID", "operator (vault owner)", [...(p.ledger.VaultID ? [] : ["Needs a VaultID."]), ...(p.ledger.LoanBrokerID ? ["Broker already created."] : [])],
     () => P.loanBrokerSet({ VaultID: p.ledger.VaultID, ManagementFeeRate: S.feeRateAtBrokerCreation(p.shopHoldingQak), DebtMaximum: p.capRlusd }));
   const need = S.coverRequired(0, plan.maxPrincipal, plan.interestDue, RULES.COVER_RATE_MINIMUM);
-  add("LoanBrokerCoverDeposit", "3. LoanBrokerCoverDeposit (RLUSD first-loss)", "operator (broker owner)", p.ledger.LoanBrokerID ? [] : ["Needs a LoanBrokerID."],
+  add("LoanBrokerCoverDeposit", `3. LoanBrokerCoverDeposit (${unitOf(p)} first-loss)`, "operator (broker owner)", p.ledger.LoanBrokerID ? [] : ["Needs a LoanBrokerID."],
     () => P.loanBrokerCoverDeposit({ LoanBrokerID: p.ledger.LoanBrokerID, asset, amount: Math.ceil(need * 100) / 100 }));
   const dg = S.depositGate(v, now);
   add("VaultDeposit", "4. VaultDeposit (lenders, subscription window only)", "lender", dg.ok ? [] : [dg.reason],
@@ -116,20 +118,27 @@ async function runAction(p, a) {
 // ---------- pages ----------
 const firstPlan = () => { const p = st.pools.find((x) => x.id === "first"); return S.planUnderCap(p.capRlusd, p.terms, S.capMathFeeRate(p)); };
 function capCard(p) {
-  const fee = S.capMathFeeRate(p), pl = S.planUnderCap(p.capRlusd, p.terms, fee), mm = S.loanMath(pl.maxPrincipal, p.terms, fee);
+  const U = esc(unitOf(p)), fee = S.capMathFeeRate(p), pl = S.planUnderCap(p.capRlusd, p.terms, fee), mm = S.loanMath(pl.maxPrincipal, p.terms, fee);
   const need = S.coverRequired(0, pl.maxPrincipal, pl.interestDue, RULES.COVER_RATE_MINIMUM);
   const d0 = S.defaultCover({ DebtTotal: pl.debtAtLoanSet, CoverRateMinimum: RULES.COVER_RATE_MINIMUM, CoverRateLiquidation: RULES.COVER_RATE_LIQUIDATION, CoverAvailable: need, DefaultAmount: pl.debtAtLoanSet });
   return `<div class="card"><h3>Cap math: maximum principal under the cap</h3>
-  <p>AssetsMaximum and DebtMaximum are both ${n(p.capRlusd)} ${ASSET}. XLS-66 counts expected interest toward both: LoanSet fails if AssetsTotal ≥ AssetsMaximum, if AssetsTotal + InterestDue &gt; AssetsMaximum, or if DebtTotal + PrincipalRequested + InterestDue &gt; DebtMaximum (all tecLIMIT_EXCEEDED). So a full ${n(p.capRlusd)} deposit plus a ${n(p.capRlusd)} principal would make LoanSet fail.</p>
-  <table><tr><td>Maximum principal that fits</td><td><b>${m2(pl.maxPrincipal)} ${ASSET}</b></td></tr>
-  <tr><td>Expected interest to the vault (InterestDue)</td><td>${m2(pl.interestDue)} ${ASSET} (fee rate used: ${fee}${p.ledger.ManagementFeeRate == null ? ", the lower fee tier, so the bound holds for either tier" : ""})</td></tr>
+  <p>AssetsMaximum and DebtMaximum are both ${n(p.capRlusd)} ${U}. XLS-66 counts expected interest toward both: LoanSet fails if AssetsTotal ≥ AssetsMaximum, if AssetsTotal + InterestDue &gt; AssetsMaximum, or if DebtTotal + PrincipalRequested + InterestDue &gt; DebtMaximum (all tecLIMIT_EXCEEDED). So a full ${n(p.capRlusd)} deposit plus a ${n(p.capRlusd)} principal would make LoanSet fail.</p>
+  <table><tr><td>Maximum principal that fits</td><td><b>${m2(pl.maxPrincipal)} ${U}</b></td></tr>
+  <tr><td>Expected interest to the vault (InterestDue)</td><td>${m2(pl.interestDue)} ${U} (fee rate used: ${fee}${p.ledger.ManagementFeeRate == null ? ", the lower fee tier, so the bound holds for either tier" : ""})</td></tr>
   <tr><td>Principal + InterestDue</td><td>${m2(pl.debtAtLoanSet)} ≤ ${n(p.capRlusd)}</td></tr>
-  <tr><td>Deposit target (app stops here)</td><td>${m2(pl.depositTarget)} ${ASSET}. The vault is public, so the ledger itself accepts deposits up to AssetsMaximum. If direct deposits push AssetsTotal to ${n(p.capRlusd)}, LoanSet fails and lenders wait for RedemptionDate.</td></tr>
-  <tr><td>Fixed installment (PeriodicPayment)</td><td>${m2(mm.periodicPayment)} ${ASSET} × ${n(p.terms.PaymentTotal)}</td></tr>
-  <tr><td>Cover required before LoanSet</td><td>${m2(need)} ${ASSET} = (DebtTotal + PrincipalRequested + InterestDue) × CoverRateMinimum ${pctOf(RULES.COVER_RATE_MINIMUM)}</td></tr>
-  <tr><td>Default with no payments made</td><td>DefaultCovered = min(${m2(pl.debtAtLoanSet)} × ${pctOf(RULES.COVER_RATE_MINIMUM)} × ${pctOf(RULES.COVER_RATE_LIQUIDATION)}, ${m2(pl.debtAtLoanSet)}, CoverAvailable) = ${m2(d0.defaultCovered)}; written down on this vault: ${m2(d0.vaultLoss)} ${ASSET}</td></tr></table>
-  <p class="note">The ${n(p.capRlusd)} ${ASSET} cap is unchanged. Rounded down to the cent with a ${RULES.ROUNDING_MARGIN} ${ASSET} margin for ledger rounding. Formulas: XLS-66 Appendix A-2 (1), (5)-(7), (30)-(33).</p></div>`;
+  <tr><td>Deposit target (app stops here)</td><td>${m2(pl.depositTarget)} ${U}. The vault is public, so the ledger itself accepts deposits up to AssetsMaximum. If direct deposits push AssetsTotal to ${n(p.capRlusd)}, LoanSet fails and lenders wait for RedemptionDate.</td></tr>
+  <tr><td>Fixed installment (PeriodicPayment)</td><td>${m2(mm.periodicPayment)} ${U} × ${n(p.terms.PaymentTotal)}</td></tr>
+  <tr><td>Cover required before LoanSet</td><td>${m2(need)} ${U} = (DebtTotal + PrincipalRequested + InterestDue) × CoverRateMinimum ${pctOf(RULES.COVER_RATE_MINIMUM)}</td></tr>
+  <tr><td>Default with no payments made</td><td>DefaultCovered = min(${m2(pl.debtAtLoanSet)} × ${pctOf(RULES.COVER_RATE_MINIMUM)} × ${pctOf(RULES.COVER_RATE_LIQUIDATION)}, ${m2(pl.debtAtLoanSet)}, CoverAvailable) = ${m2(d0.defaultCovered)}; written down on this vault: ${m2(d0.vaultLoss)} ${U}</td></tr></table>
+  <p class="note">The ${n(p.capRlusd)} ${U} cap is unchanged. Rounded down to the cent with a ${RULES.ROUNDING_MARGIN} ${U} margin for ledger rounding. Formulas: XLS-66 Appendix A-2 (1), (5)-(7), (30)-(33).</p></div>`;
 }
+// Completed devnet run (static record from the test script; the objects were deleted at the end of the run, so only the transactions remain).
+function devnetRunCard() { const R = DEVNET_TEST_RUN; if (!R) return "";
+  const tx = (h) => `<a href="${esc(R.explorer)}/transactions/${esc(h)}" target="_blank" rel="noopener noreferrer"><code>${esc(h.slice(0, 10))}…</code></a>`;
+  const acct = (a) => `<a href="${esc(R.explorer)}/accounts/${esc(a)}" target="_blank" rel="noopener noreferrer"><code>${esc(a)}</code></a>`;
+  const block = (run) => `<h4>${esc(run.title)}</h4><table><tr><td>VaultID</td><td><code>${esc(run.VaultID)}</code></td></tr><tr><td>LoanBrokerID</td><td><code>${esc(run.LoanBrokerID)}</code></td></tr><tr><td>LoanID</td><td><code>${esc(run.LoanID)}</code></td></tr></table>
+    <table><tr><th>Step</th><th>Result</th><th>Tx</th></tr>${run.steps.map((x) => `<tr><td>${esc(x.step)}</td><td class="${x.ok ? "on" : "off"}">${esc(x.result)}</td><td>${tx(x.hash)}</td></tr>`).join("")}</table><p class="note">${esc(run.summary)}</p>`;
+  return `<div class="card"><h3>Devnet test run</h3><p>${esc(R.when)}. Asset: ${esc(R.assetLabel)}, issuer ${acct(R.issuer)}. Devnet only; devnet may reset without warning. ${esc(R.note)}</p>${R.runs.map(block).join("")}</div>`; }
 const pages = {
   "": () => { const pl = firstPlan(); return `<section class="hero"><div class="hero-text">
    <span class="eyebrow">Duck Bank · XRP Ledger · ${ASSET}</span>
@@ -161,7 +170,7 @@ const pages = {
    <iframe src="/qak-whitepaper.pdf" class="pdf" title="Duck Bank whitepaper"></iframe>`,
   pools: () => `<h1>Pools</h1><p class="note">One shop per vault. No pool has on-ledger objects yet.</p><div class="grid">${st.pools.map((p) => { const pl = S.planUnderCap(p.capRlusd, p.terms, S.capMathFeeRate(p));
    return `<div class="card"><h3><a href="#/pool/${encodeURIComponent(p.id)}">${esc(p.shop)}</a>${sample(p)}</h3>
-   ${esc(p.city)} · ${esc(p.purpose)} · ${stageTag(p.stage)} · ${esc(NETWORKS[p.network].label)}<br>AssetsMaximum ${n(p.capRlusd)} ${ASSET} · max principal ${m2(pl.maxPrincipal)}<br>
+   ${esc(p.city)} · ${esc(p.purpose)} · ${stageTag(p.stage)} · ${esc(NETWORKS[p.network].label)}<br>AssetsMaximum ${n(p.capRlusd)} ${esc(unitOf(p))} · max principal ${m2(pl.maxPrincipal)}<br>
    ${pctOf(p.terms.InterestRate)} APR · ${n(p.terms.PaymentTotal)} × ${days(p.terms.PaymentInterval)} · grace ${days(p.terms.GracePeriod)}<br>VaultID: ${p.ledger.VaultID ? `<code>${esc(p.ledger.VaultID.slice(0, 12))}…</code>` : NC}</div>`; }).join("")}</div>`,
   pool: (id) => { const p = st.pools.find((x) => x.id === id); if (!p) return `<h1>Not found</h1><p>No pool with that id.</p><p><a class="btn" href="#/pools">Back to Pools</a></p>`;
    loadPool(p); const c = LG.pool[p.id] || {}, v = c.vault, b = c.broker, net = NETWORKS[p.network], ids = p.ledger;
@@ -178,9 +187,9 @@ const pages = {
    <tr><td>Redemption date</td><td>${red ? esc(athens(S.fromRipple(red))) + " (RedemptionDate)" : `${NC}; set at VaultCreate`}</td></tr>
    <tr><td>Phase now</td><td>${esc(S.vaultPhase(v ? { VaultID: ids.VaultID, ...v } : { VaultID: ids.VaultID, VaultKind: 1, SubscriptionDate: sub, RedemptionDate: red }, S.nowRipple()))}</td></tr>
    <tr><td>Asset</td><td>${esc(net.asset.label)}, currency ${esc(net.asset.currency)}, issuer ${net.asset.issuer ? esc(net.asset.issuer) : `<span class="warn">${esc(net.asset.placeholder || "not set")}</span>`}</td></tr>
-   <tr><td>AssetsMaximum</td><td>${n(p.capRlusd)} ${ASSET}${v ? ` (ledger: ${esc(v.AssetsMaximum)}; AssetsTotal ${esc(v.AssetsTotal)}, AssetsAvailable ${esc(v.AssetsAvailable)}, LossUnrealized ${esc(v.LossUnrealized)})` : ""}</td></tr>
-   <tr><td>DebtMaximum</td><td>${n(p.capRlusd)} ${ASSET}${b ? ` (ledger: ${esc(b.DebtMaximum)}; DebtTotal ${esc(b.DebtTotal)})` : ""}</td></tr>
-   <tr><td>CoverAvailable</td><td>${b ? esc(b.CoverAvailable) + " " + ASSET : NC}</td></tr>
+   <tr><td>AssetsMaximum</td><td>${n(p.capRlusd)} ${esc(unitOf(p))}${v ? ` (ledger: ${esc(v.AssetsMaximum)}; AssetsTotal ${esc(v.AssetsTotal)}, AssetsAvailable ${esc(v.AssetsAvailable)}, LossUnrealized ${esc(v.LossUnrealized)})` : ""}</td></tr>
+   <tr><td>DebtMaximum</td><td>${n(p.capRlusd)} ${esc(unitOf(p))}${b ? ` (ledger: ${esc(b.DebtMaximum)}; DebtTotal ${esc(b.DebtTotal)})` : ""}</td></tr>
+   <tr><td>CoverAvailable</td><td>${b ? esc(b.CoverAvailable) + " " + esc(unitOf(p)) : NC}</td></tr>
    <tr><td>CoverRateMinimum / CoverRateLiquidation</td><td>${RULES.COVER_RATE_MINIMUM} (${pctOf(RULES.COVER_RATE_MINIMUM)}) / ${RULES.COVER_RATE_LIQUIDATION} (${pctOf(RULES.COVER_RATE_LIQUIDATION)}); fixed at LoanBrokerSet</td></tr>
    <tr><td>Share non-transferable</td><td>${RULES.SHARE_NON_TRANSFERABLE ? "yes: tfVaultShareNonTransferable is set at VaultCreate, so the vault MPT share can only be redeemed" : "no"}</td></tr>
    <tr><td>Scale</td><td>${RULES.VAULT_SCALE} (IOU vault; spec range 0-18, default 6)</td></tr>
@@ -235,7 +244,7 @@ const pages = {
    <tr><td>Checked</td>${nets.map((k) => `<td>${FEAT[k].at ? esc(athens(FEAT[k].at)) : `snapshot ${esc(AMENDMENTS.snapshot.checked)}`}${FEAT[k].err ? `<br><span class="warn">${esc(FEAT[k].err)}</span>` : ""}</td>`).join("")}</tr>
    <tr><td>Vault lending in this app</td>${nets.map((k) => { const g = gateFor(k); return `<td class="${g.ok ? "on" : "off"}">${g.ok ? "allowed" : "disabled: " + esc(g.reasons.join(" "))}</td>`; }).join("")}</tr></table>
    <div class="card"><h3>Network config</h3><table><tr><th>Network</th><th>Feature flag</th><th>Lent asset</th><th>Issuer</th></tr>${nets.map((k) => { const x = NETWORKS[k]; return `<tr><td>${esc(x.label)}</td><td>${x.vaultLending ? "on when all three amendments are enabled" : `off (${esc(x.offReason)})`}</td><td>${esc(x.asset.label)}</td><td>${x.asset.issuer ? esc(x.asset.issuer) : `<span class="warn">${esc(x.asset.placeholder || "not set")}</span>`}</td></tr>`; }).join("")}</table>
-   <p class="note">RLUSD does not exist on devnet, so devnet uses a self-issued test IOU. With no test issuer configured, devnet actions stay disabled. The RLUSD issuer has clawback enabled (AllowTrustLineClawback).</p></div>
+   <p class="note">RLUSD does not exist on devnet, so devnet uses DUSD: a self-issued devnet <b>test token</b> (currency code ${esc(NETWORKS.devnet.asset.currency)}). It is not RLUSD and has no value. With no test issuer configured, devnet actions stay disabled. The RLUSD issuer has clawback enabled (AllowTrustLineClawback); the DUSD test issuer mirrors that.</p></div>${devnetRunCard()}
    <div class="card"><h3>Xaman support</h3><ul><li>Networks: ${esc(X.XAMAN_SUPPORT.forceNetwork)}</li><li>Transaction types (${GATED_TXS.length} XLS-65/66 types): ${esc(X.XAMAN_SUPPORT.txTypes)}</li><li>LoanSet counter-signature: ${esc(X.XAMAN_SUPPORT.counterparty)}</li><li>Without an API key the wallet is a mock: it shows payloads and signs nothing.</li></ul></div>
    <h2>QAK issuer</h2>${issuerCard()}`; },
 };
