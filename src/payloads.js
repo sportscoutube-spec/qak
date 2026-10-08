@@ -1,7 +1,7 @@
 // Unsigned XLS-65/66 transaction JSON for Xaman sign requests. Field and flag names are copied from the spec text.
 // Xaman fills Account, Sequence and Fee. Nothing here signs or submits.
 import { SPEC, FLAGS, RULES as R } from "./config.js";
-import { checkVaultDates, validateLoanTerms } from "./state.js";
+import { checkVaultDates, validateLoanTerms, isCondition, DROPS } from "./state.js";
 const req = (c, m) => { if (!c) throw new Error(m); };
 const isId = (x) => typeof x === "string" && /^[0-9A-F]{64}$/.test(x);
 const isAcct = (x) => typeof x === "string" && /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(x);
@@ -66,3 +66,27 @@ export function loanManage({ LoanID, action }) {
 }
 // LoanDelete (§3.9): borrower or broker owner, only when PaymentRemaining == 0.
 export function loanDelete({ LoanID }) { req(isId(LoanID), "LoanID required"); return { TransactionType: "LoanDelete", LoanID }; }
+
+// ---------- XRP escrow beside the loan (xrpl.org EscrowCreate / EscrowFinish; OfferCreate) ----------
+const drops = (xrp) => { const d = Math.round(Number(xrp) * DROPS); req(Number.isSafeInteger(d) && d > 0, "XRP amount must be > 0"); return String(d); };
+const isTime = (x) => Number.isInteger(x) && x > 0;
+// EscrowCreate by the shop: XRP to the broker wallet, locked by a PREIMAGE-SHA-256 Condition. A conditional escrow must have CancelAfter
+// (xrpl.org: "Conditional with expiration" or "Timed conditional with expiration"); FinishAfter, if set, must be before CancelAfter.
+export function escrowCreate({ Destination, amountXrp, Condition, CancelAfter, FinishAfter }) {
+  req(isAcct(Destination), "Destination (the broker wallet) required"); req(isCondition(Condition), "Condition must be a PREIMAGE-SHA-256 condition (32-byte preimage)");
+  req(isTime(CancelAfter), "CancelAfter is required for a conditional escrow");
+  if (FinishAfter !== undefined) { req(isTime(FinishAfter), "bad FinishAfter"); req(FinishAfter < CancelAfter, "FinishAfter must be before CancelAfter"); }
+  return { TransactionType: "EscrowCreate", Amount: drops(amountXrp), Destination, Condition, CancelAfter, ...(FinishAfter !== undefined ? { FinishAfter } : {}) };
+}
+// EscrowFinish (bot only: needs the fulfillment, which never reaches the browser). Any account may submit it; the XRP goes to Destination.
+export function escrowFinish({ Owner, OfferSequence, Condition, Fulfillment }) {
+  req(isAcct(Owner), "Owner required"); req(Number.isInteger(OfferSequence) && OfferSequence > 0, "OfferSequence required"); req(isCondition(Condition), "bad Condition");
+  req(typeof Fulfillment === "string" && /^A0228020[0-9A-F]{64}$/.test(Fulfillment), "Fulfillment must be a PREIMAGE-SHA-256 fulfillment for a 32-byte preimage");
+  return { TransactionType: "EscrowFinish", Owner, OfferSequence, Condition, Fulfillment };
+}
+// Sell XRP for the quote asset: OfferCreate with tfImmediateOrCancel + tfSell, so nothing rests on the book and all of TakerGets is sold
+// at or above the limit price; the payment engine fills from the order book, the AMM or both.
+export function offerSellXrp({ xrpDrops, quote, minQuote }) {
+  req(Number.isSafeInteger(xrpDrops) && xrpDrops > 0, "XRP drops required"); req(quote && isAcct(quote.issuer), "quote issuer required");
+  return { TransactionType: "OfferCreate", Flags: (FLAGS.tfImmediateOrCancel | FLAGS.tfSell) >>> 0, TakerGets: String(xrpDrops), TakerPays: { currency: quote.currency, issuer: quote.issuer, value: value(minQuote) } };
+}

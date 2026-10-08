@@ -25,7 +25,7 @@ ok("tokenomics, team, roadmap");
   assert(!S.loanSetWindowGate({ ...v, VaultKind: 0 }, t, 1001).ok); ok("window gating: subscription deposits, investment LoanSet, 60 s redemption buffer"); }
 { assert.throws(() => S.checkVaultDates(1000, 1179), /180/); S.checkVaultDates(1000, 1180); assert.throws(() => S.checkVaultDates(1000, 1000 + 946708560), /946708560/);
   assert.throws(() => S.checkVaultDates(100, 1000, 100), /tecEXPIRED/); assert.throws(() => S.checkVaultDates(null, 1000), /ClosedEnded/);
-  const d = S.planDates(FIRST_POOL.plan, 5000); assert.equal(d.SubscriptionDate, 5000 + 14 * DAY); assert.equal(d.RedemptionDate, d.SubscriptionDate + 100 * DAY); ok("VaultCreate date checks"); }
+  const d = S.planDates(FIRST_POOL.plan, 5000); assert.equal(d.SubscriptionDate, 5000 + 14 * DAY); assert.equal(d.RedemptionDate, d.SubscriptionDate + 103 * DAY); assert.equal(FIRST_POOL.plan.investmentDays, 90 + 7 + 3 + 3); ok("VaultCreate date checks (investment = term + grace + sale window + slack)"); }
 
 // Loan terms (XLS-66 §3.8.5.1)
 { const t = { PrincipalRequested: 100, InterestRate: 10000, PaymentTotal: 3, PaymentInterval: 30 * DAY };

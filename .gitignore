@@ -6,3 +6,5 @@ dist
 *.log
 .env*
 !.env.example
+bot/*.state.json
+bot/*secret*

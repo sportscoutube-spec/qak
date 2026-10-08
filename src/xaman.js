@@ -3,6 +3,7 @@
 // Xaman support for XLS-65/66 transaction types is NOT verified: Xaman's docs say transaction types from amendments that are not
 // enabled on mainnet may be unavailable. DEVNET is listed in Xaman's network rails, so payloads use options.force_network = "DEVNET".
 // Xaman does not document producing a LoanSet CounterpartySignature, so the second LoanSet signature cannot be collected here.
+// EscrowCreate is a long-standing mainnet transaction type; Xaman's developer docs state it accepts all mainnet XRPL transaction types.
 import { CONFIG, NETWORKS } from "./config.js";
 let sdk = null;
 export const wallet = { mode: "disconnected", account: null, network: null, lastSign: null };
@@ -11,6 +12,7 @@ export const hasKey = () => /^[0-9a-f-]{36}$/i.test(CONFIG.xamanApiKey) && !/^0{
 export const XAMAN_SUPPORT = {
   forceNetwork: "DEVNET is a key in Xaman's network rails, so a payload can set options.force_network: \"DEVNET\".",
   txTypes: "Not verified. Xaman's docs: transaction types for amendments that are not voted in on mainnet may be unavailable. If Xaman rejects a payload, the error is shown.",
+  escrow: "EscrowCreate (the shop's XRP escrow to the broker) is a standard mainnet transaction type. Xaman's developer docs say Xaman accepts all mainnet XRPL transaction types, so it is supported; the Condition is a plain hex field.",
   counterparty: "Not available. Xaman does not document signing a LoanSet CounterpartySignature, so the shop's counter-signature cannot be collected in this app. Note: with fixCleanup3_4_0 enabled (devnet), the counter-signature must use the counterparty hash prefix \"CPT\\0\" (0x43505400), not the normal \"STX\\0\"; a plain transaction signature is rejected as a bad signature (seen in the devnet test run).",
 };
 
@@ -39,7 +41,7 @@ export async function signTest() {
   // SignIn is a Xaman pseudo-transaction: proves address control, never submitted to the ledger.
   wallet.lastSign = await run({ TransactionType: "SignIn" }, {}, "Duck Bank sign-in test"); emit(); return wallet.lastSign;
 }
-// Sign request for an XLS-65/66 transaction on `net`. submit=false returns the signed blob without submitting (used for the first LoanSet signature).
+// Sign request for an XLS-65/66 transaction or the escrow-path EscrowCreate on `net`. submit=false returns the signed blob without submitting (used for the first LoanSet signature).
 export async function signTx(txjson, net, { submit = true, instruction = "" } = {}) {
   const n = NETWORKS[net]; if (!n || !n.vaultLending) throw new Error("this network is not enabled for vault lending in this build");
   if (wallet.mode === "mock") return { mock: true, signed: false, note: "mock: nothing signed or submitted", txjson };

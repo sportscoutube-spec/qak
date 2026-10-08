@@ -16,7 +16,7 @@ td.n{text-align:right;white-space:nowrap}.cover{height:257mm;display:flex;flex-d
 <section class="cover">
  <div><div class="tag">Whitepaper · October 2026</div>
   <h1><img class="mark" src="../public/qak-mark.png" alt="">Duck Bank</h1>
-  <p class="lead">Short loans to named shops on the XRP Ledger.<br>One shop per vault. Lenders hold the vault MPT share.</p></div>
+  <p class="lead">Short loans to named shops on the XRP Ledger.<br>One shop per vault. Lenders hold the vault MPT share.<br>Beside each loan, the shop's XRP sits in an escrow to the broker.</p></div>
  <img class="banner" src="../public/banner.jpg" alt="Duck Bank">
  <div><p><b>QAK</b>: 1,000,000,000 supply, issued on FirstLedger in Q4 2026. Issuer blackholed. Issuer half in two escrows.</p>
   <p><b>Lending</b>: built on XLS-65 (Single Asset Vault) and XLS-66 (Lending Protocol). Mainnet deposits open only after
@@ -31,6 +31,9 @@ and receive <b>the vault MPT share</b>, the receipt for that shop only. If the s
 The next shop is a different vault.</p>
 <p>QAK is the app token. It lists a shop, sets the fee cut, orders the deposit queue and carries one vote per token on the listing
 and the cap. These are rules of the Duck Bank app. The ledger knows nothing about them, and no QAK ever stands as loan cover.</p>
+<p>Beside the loan, a shop that holds XRP locks it in an escrow to the broker wallet before LoanSet (section 5). XLS-66 does not see that
+escrow. The broker's bot finishes and sells it if the shop misses, which is an app step, not a ledger step. A shop with no XRP can list only
+on a small cover-only path.</p>
 
 <h2>2. The ledger model</h2>
 <p>Every field, flag and error below is taken from the XLS-65 and XLS-66 specifications (including the closed-ended vault
@@ -44,7 +47,7 @@ extension and LendingProtocolV1_1).</p>
 <tr><td>4</td><td><code>VaultDeposit</code></td><td>Only while now ≤ SubscriptionDate; later deposits fail <code>tecEXPIRED</code>. Withdrawals fail <code>tecTOO_SOON</code> until RedemptionDate.</td></tr>
 <tr><td>5</td><td><code>LoanSet</code></td><td>Only in the investment window. Signed by the broker and by the shop (<code>CounterpartySignature</code>; without it <code>temBAD_SIGNER</code>).
 StartDate + PaymentInterval × PaymentTotal + 60 s must be ≤ RedemptionDate. <code>GracePeriod</code> ≤ <code>PaymentInterval</code>.</td></tr>
-<tr><td>6</td><td><code>LoanPay</code></td><td>Fixed installments. A payment below the periodic payment fails <code>tecINSUFFICIENT_PAYMENT</code>; a late one needs <code>tfLoanLatePayment</code>.</td></tr>
+<tr><td>6</td><td><code>LoanPay</code></td><td>Fixed installments, sent only by the borrower (anyone else gets <code>tecNO_PERMISSION</code>). A payment below the periodic payment fails <code>tecINSUFFICIENT_PAYMENT</code>; a late one needs <code>tfLoanLatePayment</code> and settles exactly one installment. On an impaired loan LoanPay works and lifts the impairment; after default it fails <code>tecKILLED</code>.</td></tr>
 <tr><td>7</td><td><code>LoanManage</code></td><td><code>tfLoanImpair</code> once a payment is overdue; <code>tfLoanDefault</code> once now &gt; NextPaymentDueDate + GracePeriod.</td></tr>
 <tr><td>8</td><td><code>LoanDelete</code></td><td>When PaymentRemaining is 0: the loan is settled or written off.</td></tr></table>
 <p>One vault serves one shop, and never a second. The vault's pseudo-account holds the RLUSD and issues the shares. It cannot receive
@@ -76,18 +79,56 @@ algorithmic protection against default. What the ledger does, after the grace pe
 <div class="box">DefaultCovered = min(DebtTotal × CoverRateMinimum × CoverRateLiquidation, DefaultAmount, CoverAvailable)<br>
 Vault loss = DefaultAmount − DefaultCovered, written down on that vault only.</div>
 <p>Worked on the first pool, if nothing is repaid: DefaultCovered = min(9,999.98 × 15% × 100%, 9,999.98, 1,500.00) = 1,500.00 RLUSD of cover
-moved into the vault, and 8,499.98 RLUSD written down on that vault. No other vault is touched. Interest is booked into AssetsTotal at LoanSet,
-before it is paid. Redemption still opens on RedemptionDate even if the loan is late.</p>
+moved into the vault, and 8,499.98 RLUSD written down on that vault. No other vault is touched. The XLS-66 text books expected interest into AssetsTotal at LoanSet; on devnet with LendingProtocolV1_1
+the ledger booked interest only as payments arrived (seen in our devnet run). The app counts expected interest toward the caps and the cover,
+which is the stricter bound. Redemption still opens on RedemptionDate even if the loan is late.</p>
+<p>The shop's XRP escrow (section 5) does not change this formula. Whatever the bot's sale brings in reaches the vault only as a LoanPay that the
+shop has signed, before the default; the rest is still written down.</p>
 
-<h2 class="pb">5. QAK</h2>
+<h2 class="pb">5. The XRP escrow beside the loan</h2>
+<p>Escrow fields and errors are from the XRPL Escrow documentation; the swap math is from the AMM (XLS-30) and DEX documentation. XLS-66 does not
+take this escrow as collateral, and it never sells it. Everything the ledger does not enforce is marked <b>app rule</b>.</p>
+<table><tr><th>#</th><th>Step</th><th>Who</th><th>What the ledger checks</th></tr>
+<tr><td>1</td><td><code>EscrowCreate</code> before LoanSet</td><td>shop (Xaman)</td><td>XRP <code>Amount</code> in drops to <code>Destination</code> = the broker wallet; <code>Condition</code> PREIMAGE-SHA-256 (the only condition type XRPL supports);
+<code>CancelAfter</code> required for a conditional escrow; optional <code>FinishAfter</code> before it. The broker makes the preimage and keeps the fulfillment off the app.</td></tr>
+<tr><td>2</td><td>Find the escrow</td><td>app</td><td><code>ledger_entry</code> by owner + sequence: Destination, Condition, Amount and CancelAfter must match. LoanSet stays blocked in the app until this passes, and until the opening ratio is at least 150% (app rules).</td></tr>
+<tr><td>3</td><td><code>LoanSet</code></td><td>broker + shop</td><td>As in section 2. The escrow is not a LoanSet field.</td></tr>
+<tr><td>4</td><td>Watch the ratio</td><td>app (read-only)</td><td><code>amm_info</code> and <code>book_offers</code> on XRP/RLUSD (mainnet read; XRP/DUSD on devnet, or "no market").</td></tr></table>
+<div class="box">Ratio = what the escrowed XRP would fetch now if sold (AMM formula, order-book walk, or both, whichever is best) ÷ RLUSD still owed after cover.
+"Owed after cover" = DefaultAmount − DefaultCovered from the ledger's own default formula, so only the cover the ledger would actually move counts.<br>
+<b>Add line 150%</b> · <b>default line 120%</b> (app rules; both shown live on the pool page).</div>
+<p>Under 150%, the shop has a window (config: 72 hours) to add a <b>second escrow</b> (an existing escrow cannot be increased: the only escrow transactions
+are EscrowCreate, EscrowFinish and EscrowCancel) or to LoanPay the balance down. If the window ends under 120%, the bot runs. On the first pool's planned
+figures (8,499.98 RLUSD owed after 1,500.00 of cover), 150% needed about 9,010 XRP on mainnet XRP/RLUSD at 13:00 EEST on 8 October 2026
+(validated ledger 107514201), and 120% about 7,207 XRP. This moves with the market.</p>
+<h3>The four sale steps (each shown as done or stuck)</h3>
+<table><tr><th>Step</th><th>Transaction</th><th>Notes</th></tr>
+<tr><td>1. Mark</td><td><code>LoanManage</code> tfLoanImpair</td><td>The ledger allows it only once a payment is overdue. A price breach alone, with payments current, waits for the next due date.</td></tr>
+<tr><td>2. Finish</td><td><code>EscrowFinish</code> + fulfillment</td><td>Only after FinishAfter and before CancelAfter. Any account may submit it; the XRP goes to the broker.</td></tr>
+<tr><td>3. Sell</td><td><code>OfferCreate</code> tfImmediateOrCancel + tfSell</td><td>Fills against the AMM and the order book, with a 3% limit below the quote (config). Nothing rests on the book.</td></tr>
+<tr><td>4. LoanPay</td><td>the shop's signed <code>LoanPay</code></td><td>LoanPay is borrower-only, so the shop signs it in Xaman without submitting. The bot sends the shop exactly that amount from the proceeds and submits the shop's LoanPay. A vault deposit is not a route: VaultDeposit after SubscriptionDate fails <code>tecEXPIRED</code>, and the pseudo-account cannot receive payments.</td></tr></table>
+<p>Then <code>LoanManage</code> tfLoanDefault for the remainder, once the ledger allows it. Any shortfall is written down on that vault. The pool page derives all four
+steps from ledger reads (Loan flags, escrow entries, validated transactions); the browser holds no keys. The bot is a broker-side Node script.</p>
+<h3>Where the ledger and the plan differ</h3>
+<table><tr><th>Point</th><th>Ledger fact</th><th>How Duck Bank handles it</th></tr>
+<tr><td>Finish timing</td><td>The broker can finish whenever it holds the fulfillment, after FinishAfter and before CancelAfter.</td><td>"A price drop never finishes the escrow" and "the sale comes only after LoanManage" are app rules (broker promises). FinishAfter = SubscriptionDate + PaymentInterval, the first moment any payment can be overdue, so the ledger does block an earlier finish.</td></tr>
+<tr><td>XRP back to a repaying shop</td><td>Only <code>EscrowCancel</code> after CancelAfter (before it: <code>tecNO_PERMISSION</code>, seen on devnet).</td><td>CancelAfter = RedemptionDate + 1 day. The app's LoanSet deadline is RedemptionDate − term − grace − sale window, so the last due date, the grace period and the bot's sale window all end before CancelAfter. A shop that repays waits for CancelAfter, unless the broker finishes and sends the XRP back earlier (app rule).</td></tr>
+<tr><td>Getting proceeds into the vault</td><td>LoanPay is borrower-only; it works on an impaired loan and fails <code>tecKILLED</code> after default. A late LoanPay settles one installment, with no partial payments.</td><td>Order: impair → finish → sell → the shop's LoanPay while impaired → default the remainder. Proceeds below one installment cannot be delivered and count as shortfall. Without the shop's signature, step 4 is stuck. Leftover proceeds go back to the shop once the loan is closed (app rule, open for review).</td></tr>
+<tr><td>Timing in config</td><td>Default needs now &gt; NextPaymentDueDate + GracePeriod.</td><td>Sale window 3 days (config) after the grace period; investment window = term + grace + sale window + 3 days of slack (first pool: 103 days).</td></tr></table>
+<h3>No XRP: the cover-only path</h3>
+<p>A shop with no XRP lists on the cover-only path with a cap of at most 1,000 RLUSD (config) and a file kept on the desk, off-ledger. It has no escrow;
+on default only RLUSD cover reaches the vault.</p>
+
+<h2 class="pb">6. QAK</h2>
 <table><tr><th>Role</th><th>App rule</th></tr>
 <tr><td>Listing</td><td>A shop locks 250,000 QAK to be listed. This is an app lock.</td></tr>
 <tr><td>Fee cut</td><td>The app reads the shop's QAK balance on the ledger when the broker is created: at least 100,000 QAK sets <code>ManagementFeeRate</code> 750 (0.75% of interest), otherwise 1000 (1.00%). The rate is fixed after creation.</td></tr>
 <tr><td>Queue</td><td>Locked QAK orders the Duck Bank deposit queue. It does not reserve a fill; the vault is public during Subscription.</td></tr>
 <tr><td>Vote</td><td>One QAK, one vote, on the listing and the cap. A vote cannot move another vault's deposits.</td></tr></table>
-<div class="box warn">Any QAK escrow or lock is an app lock. It is not <code>CoverAvailable</code>: cover accepts only the vault asset, RLUSD. On default the ledger takes RLUSD cover only.</div>
+<div class="box warn">Any QAK escrow or lock is an app lock. It is not <code>CoverAvailable</code>: cover accepts only the vault asset, RLUSD. On default the ledger takes RLUSD cover only.
+QAK is never escrowed for a loan and never sold by the bot; the shop's escrow holds XRP.</div>
 
-<h2>6. Tokenomics</h2>
+<h2>7. Tokenomics</h2>
 <p>QAK was created on FirstLedger in Q4 2026. Supply is 1,000,000,000, fixed.</p>
 <table><tr><th>Bucket</th><th>Of supply</th><th>Tokens</th><th>Use</th></tr>
 <tr><td>Public pool</td><td class="n">50%</td><td class="n">500,000,000</td><td>Sold into the opening FirstLedger pool.</td></tr>
@@ -103,7 +144,7 @@ before it is paid. Redemption still opens on RedemptionDate even if the loan is 
 <tr><td>1</td><td class="n">125,000,000 QAK</td><td>8 October 2026, 15:49 EEST</td></tr>
 <tr><td>2</td><td class="n">375,000,000 QAK</td><td>7 November 2026, 16:24 EET</td></tr></table>
 
-<h2>7. Status and gating</h2>
+<h2>8. Status and gating</h2>
 <p>XLS-65/66 need three amendments: SingleAssetVault, LendingProtocol and LendingProtocolV1_1. A rippled release is not activation:
 an amendment counts only once validators enable it on that network. The app's Status page runs the read-only <code>feature</code> request
 on each network. On 8 October 2026: mainnet none enabled, testnet none enabled, devnet all three enabled.</p>
@@ -111,34 +152,44 @@ on each network. On 8 October 2026: mainnet none enabled, testnet none enabled, 
 <li><b>Testnet:</b> status only.</li>
 <li><b>Devnet:</b> the real transactions, once all three amendments read enabled. RLUSD does not exist on devnet, so the app uses a
 labelled test IOU from a configured test issuer; with none configured, devnet actions stay disabled.</li></ul>
+<p><b>Devnet run of the escrow path (8 October 2026, 13:13–13:35 EEST, DUSD test token, cap 50).</b> The shop escrowed 15 + 9 XRP to the broker wallet.
+The app kept LoanSet blocked at a 127.6% ratio and opened it at 176%. After a price drop and a missed installment, the bot marked the loan, finished both escrows,
+sold 24 XRP for 31.53 DUSD and paid 24.99 DUSD as the shop's own signed LoanPay. LoanPay worked on the impaired loan; nothing was blocked. The remaining 6.55 DUSD
+was below one installment and stayed undelivered. After the next miss, the default moved 3.75 DUSD of cover, and 21.24 DUSD was written down on that vault.
+The broker's LoanPay (<code>tecNO_PERMISSION</code>), the shop's early EscrowCancel (<code>tecNO_PERMISSION</code>), a VaultDeposit after SubscriptionDate
+(<code>tecEXPIRED</code>) and LoanPay after default (<code>tecKILLED</code>) were rejected as expected; after CancelAfter, a third party cancelled leftover
+escrows and the XRP went back to the shop. Every hash is on the app's Status page.</p>
 <p>Xaman is the wallet. Its network list includes DEVNET, so sign requests can be forced to devnet. Xaman support for the XLS-65/66
 transaction types is not verified, and Xaman does not document producing a LoanSet <code>CounterpartySignature</code>, so the shop's
-counter-signature cannot yet be collected in the app. Without an API key, the app runs a wallet labelled mock that signs nothing.</p>
+counter-signature cannot yet be collected in the app. EscrowCreate is a standard mainnet transaction type, and Xaman's developer documentation
+says it accepts all mainnet transaction types. Without an API key, the app runs a wallet labelled mock that signs nothing.</p>
 
-<h2>8. Risks</h2>
+<h2>9. Risks</h2>
 <ul><li><b>Clawback.</b> The RLUSD issuer has clawback enabled. It can claw back RLUSD from a vault and broker cover above the minimum.</li>
-<li><b>No on-chain collateral.</b> Loans are unsecured on the ledger.</li>
-<li><b>No liquidation.</b> On default only RLUSD cover, up to the rates, reaches the vault. The rest is written down on that vault.</li>
+<li><b>No on-chain collateral.</b> Loans are unsecured on the ledger. The shop's XRP escrow sits beside the loan; XLS-66 does not take it as collateral.</li>
+<li><b>No ledger liquidation.</b> On default only RLUSD cover, up to the rates, reaches the vault. The bot's XRP sale is an app step: it may fall short (thin book, price gap, the 3% limit), it needs the shop's signed LoanPay, and the broker can finish an escrow at any time it holds the fulfillment. The rest is written down on that vault.</li>
 <li><b>Lock-up.</b> Withdrawals are blocked from SubscriptionDate to RedemptionDate.</li>
-<li><b>Interest booked at LoanSet.</b> The vault shows expected interest before it is paid.</li>
+<li><b>Interest booking.</b> The XLS-66 text books expected interest at LoanSet; devnet booked it as paid. The app counts expected interest toward the caps.</li>
+<li><b>XRP locked.</b> A repaying shop's XRP stays in escrow until CancelAfter. If LoanSet never happens, it also stays until CancelAfter.</li>
 <li><b>Software.</b> The code is not audited.</li></ul>
 
-<h2 class="pb">9. Team</h2>
+<h2 class="pb">10. Team</h2>
 <p>The 10% team bucket covers four published roles.</p>
 <div class="team"><div><b>McQAK</b>, Founder<br>The desk: which shop is listed, the cap and the terms.</div>
-<div><b>Donald QAK</b>, CTO<br>The app, the Xaman connection and the vault path.</div>
+<div><b>Donald QAK</b>, CTO<br>The app, the Xaman connection, the vault path and the escrow bot.</div>
 <div><b>Della</b>, Marketing<br>The channel, the shop listings and the public note when a pool opens or repays.</div>
 <div><b>Huey QAK</b>, Developer<br>The pool page, the listing lock check and the test signatures.</div></div>
 
-<h2>10. Roadmap</h2>
+<h2>11. Roadmap</h2>
 <table><tr><th>When</th><th>Step</th><th>What</th></tr>
 <tr><td>Q4 2026</td><td>Mint (done)</td><td>QAK issued on FirstLedger: 1,000,000,000 supply, 50 XRP starting liquidity, 1% AMM fee, 15-minute anti-sniper. Issuer blackholed; issuer half in two escrows.</td></tr>
-<tr><td>Next</td><td>Devnet vault + broker</td><td>One shop: a closed-ended vault and a loan broker on devnet with a labelled test IOU, cap 10,000.</td></tr>
+<tr><td>Next</td><td>Devnet vault, broker and XRP escrow bot</td><td>One shop on devnet with the DUSD test token: closed-ended vault, loan broker, cover, deposits, the shop's XRP escrow to the broker, a dual-signed LoanSet, LoanPay, and the broker-side escrow bot (LoanManage, EscrowFinish, sell, LoanPay).</td></tr>
 <tr><td>After the three amendments are enabled on mainnet</td><td>Mainnet deposits</td><td>Mainnet deposits open only once SingleAssetVault, LendingProtocol and LendingProtocolV1_1 are all enabled on mainnet.</td></tr></table>
 
-<h2>11. References</h2>
+<h2>12. References</h2>
 <ul><li>XLS-65 Single Asset Vault, including the closed-ended vault extension (XLS-65.1.4).</li>
 <li>XLS-66 Lending Protocol, including LendingProtocolV1_1.</li>
+<li>XRPL documentation: Escrow, EscrowCreate, EscrowFinish, EscrowCancel; crypto-conditions; Automated Market Makers (XLS-30), amm_info; book_offers; OfferCreate.</li>
 <li>App: https://trustline-tan.vercel.app (Status page: live amendment check). Venue: FirstLedger. Wallet: Xaman.</li></ul>
 <p class="small">This paper describes software and token rules. It is not an offer of securities or a promise of returns. Ledger facts were read on 8 October 2026.</p>
 </body></html>

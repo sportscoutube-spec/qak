@@ -1,0 +1,7 @@
+{
+  "name": "duck-bank-escrow-bot",
+  "private": true,
+  "type": "module",
+  "description": "Broker-side Duck Bank escrow bot (Node only; holds the broker key and the escrow fulfillment, never the browser)",
+  "dependencies": { "xrpl": "^5.3.0" }
+}
