@@ -1,0 +1,144 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Duck Bank QAK Whitepaper</title>
+<style>
+@page{size:A4;margin:16mm 16mm 18mm}
+*{box-sizing:border-box}body{font-family:"DejaVu Sans","Liberation Sans",Arial,sans-serif;color:#1b1f24;font-size:9.6pt;line-height:1.45;margin:0}
+h1{font-size:30pt;margin:0;letter-spacing:.02em}h2{font-size:14pt;color:#0b3d91;border-bottom:2px solid #f2b705;padding-bottom:2px;margin:16px 0 6px;break-after:avoid}
+h3{font-size:10.5pt;margin:10px 0 4px;break-after:avoid}p{margin:4px 0 6px}code{font-family:"DejaVu Sans Mono",monospace;font-size:8.4pt;background:#f1f3f6;padding:0 2px;border-radius:2px}
+table{border-collapse:collapse;width:100%;margin:6px 0 8px;font-size:8.8pt;break-inside:avoid}th,td{border:1px solid #d0d7de;padding:4px 6px;text-align:left;vertical-align:top}th{background:#f1f3f6}
+td.n{text-align:right;white-space:nowrap}.cover{height:257mm;display:flex;flex-direction:column;justify-content:space-between;break-after:page}
+.cover img.banner{width:100%;border-radius:6px}.cover .mark{width:64px;height:64px;vertical-align:middle;margin-right:10px}
+.tag{font-size:9pt;letter-spacing:.2em;color:#6b7280;text-transform:uppercase}.lead{font-size:13pt;margin:8px 0}
+.box{border:1px solid #d0d7de;border-left:4px solid #0b3d91;background:#f8fafc;padding:6px 10px;margin:8px 0;break-inside:avoid}
+.warn{border-left-color:#c2410c}ol,ul{margin:4px 0 6px 18px;padding:0}li{margin:2px 0}.pb{break-before:page}.small{font-size:8.2pt;color:#4b5563}
+.team{display:grid;grid-template-columns:1fr 1fr;gap:8px}.team div{border:1px solid #d0d7de;border-radius:6px;padding:6px 10px}
+</style></head><body>
+
+<section class="cover">
+ <div><div class="tag">Whitepaper · October 2026</div>
+  <h1><img class="mark" src="../public/qak-mark.png" alt="">Duck Bank</h1>
+  <p class="lead">Short loans to named shops on the XRP Ledger.<br>One shop per vault. Lenders hold the vault MPT share.</p></div>
+ <img class="banner" src="../public/banner.jpg" alt="Duck Bank">
+ <div><p><b>QAK</b>: 1,000,000,000 supply, issued on FirstLedger in Q4 2026. Issuer blackholed. Issuer half in two escrows.</p>
+  <p><b>Lending</b>: built on XLS-65 (Single Asset Vault) and XLS-66 (Lending Protocol). Mainnet deposits open only after
+  SingleAssetVault, LendingProtocol and LendingProtocolV1_1 are enabled on mainnet. On 8 October 2026 none of them is.</p>
+  <p class="small">https://trustline-tan.vercel.app · Not audited. Not an offer.</p></div>
+</section>
+
+<h2>1. The desk</h2>
+<p>Duck Bank lends RLUSD to a named shop for a short, fixed term: stock for a season, a counter, a delivery. Each shop gets its own
+closed-ended vault and its own loan broker on the XRP Ledger. Lenders deposit RLUSD into that vault during its subscription window
+and receive <b>the vault MPT share</b>, the receipt for that shop only. If the shop misses, the loss is written down on that vault.
+The next shop is a different vault.</p>
+<p>QAK is the app token. It lists a shop, sets the fee cut, orders the deposit queue and carries one vote per token on the listing
+and the cap. These are rules of the Duck Bank app. The ledger knows nothing about them, and no QAK ever stands as loan cover.</p>
+
+<h2>2. The ledger model</h2>
+<p>Every field, flag and error below is taken from the XLS-65 and XLS-66 specifications (including the closed-ended vault
+extension and LendingProtocolV1_1).</p>
+<table><tr><th>#</th><th>Transaction</th><th>What Duck Bank sets</th></tr>
+<tr><td>1</td><td><code>VaultCreate</code></td><td>Asset RLUSD; <code>VaultKind</code> 1 (ClosedEnded) with <code>SubscriptionDate</code> and <code>RedemptionDate</code>;
+<code>AssetsMaximum</code> = the cap; <code>Scale</code> 6 (IOU range 0–18); flag <code>tfVaultShareNonTransferable</code>. Shop name, city and purpose stay off-ledger.</td></tr>
+<tr><td>2</td><td><code>LoanBrokerSet</code></td><td>On that VaultID: <code>DebtMaximum</code> = the cap, <code>CoverRateMinimum</code> 15000 (15%), <code>CoverRateLiquidation</code> 100000 (100%),
+<code>ManagementFeeRate</code> 1000 or 750 (fixed once the broker exists).</td></tr>
+<tr><td>3</td><td><code>LoanBrokerCoverDeposit</code></td><td>RLUSD first-loss cover. Only the broker owner can deposit, and only the vault asset (<code>tecWRONG_ASSET</code> otherwise).</td></tr>
+<tr><td>4</td><td><code>VaultDeposit</code></td><td>Only while now ≤ SubscriptionDate; later deposits fail <code>tecEXPIRED</code>. Withdrawals fail <code>tecTOO_SOON</code> until RedemptionDate.</td></tr>
+<tr><td>5</td><td><code>LoanSet</code></td><td>Only in the investment window. Signed by the broker and by the shop (<code>CounterpartySignature</code>; without it <code>temBAD_SIGNER</code>).
+StartDate + PaymentInterval × PaymentTotal + 60 s must be ≤ RedemptionDate. <code>GracePeriod</code> ≤ <code>PaymentInterval</code>.</td></tr>
+<tr><td>6</td><td><code>LoanPay</code></td><td>Fixed installments. A payment below the periodic payment fails <code>tecINSUFFICIENT_PAYMENT</code>; a late one needs <code>tfLoanLatePayment</code>.</td></tr>
+<tr><td>7</td><td><code>LoanManage</code></td><td><code>tfLoanImpair</code> once a payment is overdue; <code>tfLoanDefault</code> once now &gt; NextPaymentDueDate + GracePeriod.</td></tr>
+<tr><td>8</td><td><code>LoanDelete</code></td><td>When PaymentRemaining is 0: the loan is settled or written off.</td></tr></table>
+<p>One vault serves one shop, and never a second. The vault's pseudo-account holds the RLUSD and issues the shares. It cannot receive
+ordinary payments, so money reaches lenders only through <code>VaultDeposit</code>, <code>LoanPay</code> and, on default, cover moved by <code>LoanManage</code>.</p>
+<div class="box">The lender holds the vault MPT share. It is non-transferable, redeemable with <code>VaultWithdraw</code> from RedemptionDate, and
+it tracks that one vault's assets, including any loss written down on it.</div>
+
+<h2>3. The first pool</h2>
+<p>One shop, a 10,000 RLUSD cap, short term: Kostas Bakery, Athens, stock. Terms: <code>InterestRate</code> 10000 (10% a year),
+<code>PaymentTotal</code> 3, <code>PaymentInterval</code> 30 days, <code>GracePeriod</code> 7 days. The vault and broker have not been created yet,
+so there is no VaultID or LoanBrokerID to publish.</p>
+<h3>Maximum principal under the cap</h3>
+<p><code>AssetsMaximum</code> = <code>DebtMaximum</code> = 10,000 RLUSD. XLS-66 counts the expected interest toward both limits. LoanSet fails
+if AssetsTotal ≥ AssetsMaximum, if AssetsTotal + InterestDue &gt; AssetsMaximum, or if DebtTotal + Principal + InterestDue &gt; DebtMaximum
+(all <code>tecLIMIT_EXCEEDED</code>). A full 10,000 deposit plus a 10,000 principal therefore cannot be lent.</p>
+<table><tr><th>Item</th><th>Value</th><th>How</th></tr>
+<tr><td>Periodic payment</td><td class="n">3,333.73 × 3</td><td>Amortized payment, periodic rate = 10% × 30 days / 365 days (XLS-66 A-2)</td></tr>
+<tr><td>Maximum principal</td><td class="n"><b>9,839.02 RLUSD</b></td><td>Largest principal with principal + InterestDue ≤ 10,000, rounded down to the cent with a 0.01 margin</td></tr>
+<tr><td>InterestDue to the vault</td><td class="n">160.96 RLUSD</td><td>Gross interest less the management fee, at fee rate 750 (the lower fee gives the larger InterestDue, so the bound holds for both tiers)</td></tr>
+<tr><td>Principal + InterestDue</td><td class="n">9,999.98 RLUSD</td><td>≤ AssetsMaximum and ≤ DebtMaximum</td></tr>
+<tr><td>Deposit target</td><td class="n">9,839.02 RLUSD</td><td>The app stops inviting deposits at the principal</td></tr>
+<tr><td>Cover before LoanSet</td><td class="n">1,500.00 RLUSD</td><td>(DebtTotal + Principal + InterestDue) × CoverRateMinimum 15%</td></tr></table>
+<p class="small">The vault is public. The ledger itself accepts deposits up to AssetsMaximum, so direct deposits can push AssetsTotal to 10,000.
+In that case LoanSet fails and lenders wait for RedemptionDate to withdraw.</p>
+
+<h2>4. When a shop misses</h2>
+<p>There is no on-chain collateral and no liquidation. The XLS-66 security section states that the protocol does not offer on-chain
+algorithmic protection against default. What the ledger does, after the grace period, is <code>LoanManage</code> with <code>tfLoanDefault</code>:</p>
+<div class="box">DefaultCovered = min(DebtTotal × CoverRateMinimum × CoverRateLiquidation, DefaultAmount, CoverAvailable)<br>
+Vault loss = DefaultAmount − DefaultCovered, written down on that vault only.</div>
+<p>Worked on the first pool, if nothing is repaid: DefaultCovered = min(9,999.98 × 15% × 100%, 9,999.98, 1,500.00) = 1,500.00 RLUSD of cover
+moved into the vault, and 8,499.98 RLUSD written down on that vault. No other vault is touched. Interest is booked into AssetsTotal at LoanSet,
+before it is paid. Redemption still opens on RedemptionDate even if the loan is late.</p>
+
+<h2 class="pb">5. QAK</h2>
+<table><tr><th>Role</th><th>App rule</th></tr>
+<tr><td>Listing</td><td>A shop locks 250,000 QAK to be listed. This is an app lock.</td></tr>
+<tr><td>Fee cut</td><td>The app reads the shop's QAK balance on the ledger when the broker is created: at least 100,000 QAK sets <code>ManagementFeeRate</code> 750 (0.75% of interest), otherwise 1000 (1.00%). The rate is fixed after creation.</td></tr>
+<tr><td>Queue</td><td>Locked QAK orders the Duck Bank deposit queue. It does not reserve a fill; the vault is public during Subscription.</td></tr>
+<tr><td>Vote</td><td>One QAK, one vote, on the listing and the cap. A vote cannot move another vault's deposits.</td></tr></table>
+<div class="box warn">Any QAK escrow or lock is an app lock. It is not <code>CoverAvailable</code>: cover accepts only the vault asset, RLUSD. On default the ledger takes RLUSD cover only.</div>
+
+<h2>6. Tokenomics</h2>
+<p>QAK was created on FirstLedger in Q4 2026. Supply is 1,000,000,000, fixed.</p>
+<table><tr><th>Bucket</th><th>Of supply</th><th>Tokens</th><th>Use</th></tr>
+<tr><td>Public pool</td><td class="n">50%</td><td class="n">500,000,000</td><td>Sold into the opening FirstLedger pool.</td></tr>
+<tr><td>Team</td><td class="n">10%</td><td class="n">100,000,000</td><td>McQAK, Donald QAK, Della and Huey QAK. From the escrowed issuer half.</td></tr>
+<tr><td>Marketing</td><td class="n">20%</td><td class="n">200,000,000</td><td>Listings, content and the shop desk. From the escrowed issuer half.</td></tr>
+<tr><td>AMM</td><td class="n">20%</td><td class="n">200,000,000</td><td>Added to the QAK/XRP AMM after unlock. From the escrowed issuer half.</td></tr></table>
+<h3>Launch</h3>
+<p>FirstLedger, 50 XRP starting liquidity, 1% AMM fee, 15-minute anti-sniper.</p>
+<h3>Issuer and escrows (read live from the ledger on 8 October 2026)</h3>
+<p>The issuer <code>r98RkKUasH5vA3mshD5Bi3eAVHCYwziY9M</code> is blackholed: master key disabled, regular key set to the blackhole address
+<code>rrrrrrrrrrrrrrrrrrrrBZbvji</code>, no signer list. No more QAK can be issued. The issuer half, 500,000,000 QAK, is in two escrows:</p>
+<table><tr><th>Escrow</th><th>Tokens</th><th>Unlocks (FinishAfter)</th></tr>
+<tr><td>1</td><td class="n">125,000,000 QAK</td><td>8 October 2026, 15:49 EEST</td></tr>
+<tr><td>2</td><td class="n">375,000,000 QAK</td><td>7 November 2026, 16:24 EET</td></tr></table>
+
+<h2>7. Status and gating</h2>
+<p>XLS-65/66 need three amendments: SingleAssetVault, LendingProtocol and LendingProtocolV1_1. A rippled release is not activation:
+an amendment counts only once validators enable it on that network. The app's Status page runs the read-only <code>feature</code> request
+on each network. On 8 October 2026: mainnet none enabled, testnet none enabled, devnet all three enabled.</p>
+<ul><li><b>Mainnet:</b> vault lending is off in the build itself, regardless of amendment status. No mainnet deposits.</li>
+<li><b>Testnet:</b> status only.</li>
+<li><b>Devnet:</b> the real transactions, once all three amendments read enabled. RLUSD does not exist on devnet, so the app uses a
+labelled test IOU from a configured test issuer; with none configured, devnet actions stay disabled.</li></ul>
+<p>Xaman is the wallet. Its network list includes DEVNET, so sign requests can be forced to devnet. Xaman support for the XLS-65/66
+transaction types is not verified, and Xaman does not document producing a LoanSet <code>CounterpartySignature</code>, so the shop's
+counter-signature cannot yet be collected in the app. Without an API key, the app runs a wallet labelled mock that signs nothing.</p>
+
+<h2>8. Risks</h2>
+<ul><li><b>Clawback.</b> The RLUSD issuer has clawback enabled. It can claw back RLUSD from a vault and broker cover above the minimum.</li>
+<li><b>No on-chain collateral.</b> Loans are unsecured on the ledger.</li>
+<li><b>No liquidation.</b> On default only RLUSD cover, up to the rates, reaches the vault. The rest is written down on that vault.</li>
+<li><b>Lock-up.</b> Withdrawals are blocked from SubscriptionDate to RedemptionDate.</li>
+<li><b>Interest booked at LoanSet.</b> The vault shows expected interest before it is paid.</li>
+<li><b>Software.</b> The code is not audited.</li></ul>
+
+<h2 class="pb">9. Team</h2>
+<p>The 10% team bucket covers four published roles.</p>
+<div class="team"><div><b>McQAK</b>, Founder<br>The desk: which shop is listed, the cap and the terms.</div>
+<div><b>Donald QAK</b>, CTO<br>The app, the Xaman connection and the vault path.</div>
+<div><b>Della</b>, Marketing<br>The channel, the shop listings and the public note when a pool opens or repays.</div>
+<div><b>Huey QAK</b>, Developer<br>The pool page, the listing lock check and the test signatures.</div></div>
+
+<h2>10. Roadmap</h2>
+<table><tr><th>When</th><th>Step</th><th>What</th></tr>
+<tr><td>Q4 2026</td><td>Mint (done)</td><td>QAK issued on FirstLedger: 1,000,000,000 supply, 50 XRP starting liquidity, 1% AMM fee, 15-minute anti-sniper. Issuer blackholed; issuer half in two escrows.</td></tr>
+<tr><td>Next</td><td>Devnet vault + broker</td><td>One shop: a closed-ended vault and a loan broker on devnet with a labelled test IOU, cap 10,000.</td></tr>
+<tr><td>After the three amendments are enabled on mainnet</td><td>Mainnet deposits</td><td>Mainnet deposits open only once SingleAssetVault, LendingProtocol and LendingProtocolV1_1 are all enabled on mainnet.</td></tr></table>
+
+<h2>11. References</h2>
+<ul><li>XLS-65 Single Asset Vault, including the closed-ended vault extension (XLS-65.1.4).</li>
+<li>XLS-66 Lending Protocol, including LendingProtocolV1_1.</li>
+<li>App: https://trustline-tan.vercel.app (Status page: live amendment check). Venue: FirstLedger. Wallet: Xaman.</li></ul>
+<p class="small">This paper describes software and token rules. It is not an offer of securities or a promise of returns. Ledger facts were read on 8 October 2026.</p>
+</body></html>

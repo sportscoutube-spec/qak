@@ -1,7 +1,7 @@
 {
-  "name": "trustline",
+  "name": "duck-bank",
   "version": "1.0.0",
-  "description": "",
+  "description": "Duck Bank: one closed-ended XRPL vault per shop, RLUSD loans, QAK app token",
   "main": "index.js",
   "scripts": {
     "dev": "vite",

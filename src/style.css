@@ -34,3 +34,7 @@ input,select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-ra
 .tag.sample{background:#3b2f0b;color:#ffd866;border:1px solid #ffd866}.note{opacity:.75;font-size:.9em;margin:.3rem 0 1rem}
 h1,h3,td,li{overflow-wrap:anywhere}.card{min-width:0;overflow-x:auto}
 @media(max-width:760px){table{font-size:.85em}td,th{padding:.3rem}}
+/* Duck Bank ledger model */
+.muted{opacity:.65}code{font-size:.85em;word-break:break-all}.risks li{margin:.3rem 0}
+.acts li{margin:.6rem 0}.acts button{margin:.3rem .4rem .3rem 0}pre{white-space:pre-wrap;word-break:break-all;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.5rem;font-size:.8em}
+pre.out:empty{display:none}.s-applied{background:#30363d}details summary{cursor:pointer;opacity:.8}

@@ -1,131 +1,268 @@
-// Pool state machine (app rules). Nothing here touches a ledger.
-// The QAK issuer is blackholed, so "seized" below means TREATED AS SEIZED by app rule against a published balance, never a ledger clawback.
-import { RULES as R, LIMITS as L } from "./config.js";
-export const STATUSES = ["applied","listed","drawn","repaying","late","repaid","defaulted"];
-const T = { applied:["listed"], listed:["drawn"], drawn:["repaying","repaid","late"], repaying:["repaying","repaid","late"],
-  late:["repaying","repaid","defaulted"], repaid:[], defaulted:[] };
-const req = (c,m) => { if(!c) throw new Error(m); };
-const pool = (s,id) => { const p=s.pools.find(x=>x.id===id); req(p,"no pool"); return p; };
-const sum = (a) => a.reduce((t,x)=>t+x.qak,0);
-export const today=()=>Math.floor(Date.now()/864e5);
-export const capForHistory=(k)=>Math.min(R.MAX_CAP_RLUSD, Math.floor(R.INITIAL_CAP_RLUSD*(1+R.CAP_GROWTH_PCT)**k));
-export const maxCap=(p)=>capForHistory(p.onTimeLoans||0);
-export const nextCap=(p)=>capForHistory((p.onTimeLoans||0)+1);
-export const firstLossQak=(p)=>sum(p.firstLoss);
-export const minFirstLossQak=(cap,price)=>{ req(price>0,"a QAK snapshot price is required"); return Math.ceil(cap*R.FIRST_LOSS_PCT/price); };
-export const feeBps=(holdingQak)=> (Number(holdingQak)||0)>=R.DISCOUNT_MIN_HOLDING_QAK ? R.DISCOUNT_FEE_BPS : R.PROTOCOL_FEE_BPS;
-// Discount only for a ledger-verified holding. Self-declared holdings pay the full fee until a ledger balance read is wired.
-export const poolFeeBps=(p)=> p.holdingVerified ? feeBps(p.shopHoldingQak) : R.PROTOCOL_FEE_BPS;
-const isQak=(x)=>Number.isInteger(x)&&x>0&&x<=R.TOTAL_SUPPLY_QAK;
-export const PREVIEW_ACCOUNT="rPREVIEWxxxxxxxxxxxxxxxxxxxxxxxxx";
-export const isAccount=(who)=>typeof who==="string"&&(who===PREVIEW_ACCOUNT||/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(who));
-const reqAccount=(who)=>req(isAccount(who),"connect a Xaman account first");
-const newId=()=>"p_"+(globalThis.crypto?.randomUUID?globalThis.crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2));
-const cleanName=(v,label)=>{ const t=String(v??"").trim(); req(t.length>0,`${label} required`); req(t.length<=L.NAME_MAX,`${label}: max ${L.NAME_MAX} characters`); return t; };
-export const owedOf=(p)=>+(p.drawn*(1+p.ratePct/100*p.termDays/365)).toFixed(2);
-export const interestOf=(p)=>+(owedOf(p)-p.drawn).toFixed(2);
-export const daysLate=(p,day=today())=>p.lateSince==null?0:day-p.lateSince;
-export const shares=(p,who)=>p.totalDeposits?(p.deposits[who]||0)/p.totalDeposits:0;
-const blank=()=>({deposits:{},totalDeposits:0,drawn:0,repaid:0,interestPaid:0,firstLoss:[],frozen:false,hadLate:false,overdue:0,lateSince:null,
-  votes:{yes:0,no:0},capVotes:{},voters:[],drawSnapshotPrice:null,log:[]});
+// Duck Bank model. Two layers:
+//  1. Ledger math that mirrors XLS-65/66 checks (pure functions; formulas cited per spec section).
+//  2. Off-ledger app state: applications, QAK votes, the QAK-ordered queue and shop name/city/purpose next to the ledger ids.
+// Nothing here submits a transaction.
+import { RULES as R, LIMITS as L, SPEC, AMENDMENTS, NETWORKS, FIRST_POOL, RIPPLE_EPOCH } from "./config.js";
+const req = (c, m) => { if (!c) throw new Error(m); };
+const DAY = 86400;
+export const nowRipple = (ms = Date.now()) => Math.floor(ms / 1000) - RIPPLE_EPOCH;
+export const fromRipple = (t) => (t == null ? null : new Date((t + RIPPLE_EPOCH) * 1000));
+const floorCents = (x) => Math.floor(x * 100 + 1e-9) / 100;
+const tenthBps = (v) => v / SPEC.TENTH_BPS_100PCT;
 
-export function seed(){
-  const p=(id,shop,city,purpose,cap,rate,term,status,onTimeLoans,o={})=>({...blank(),id,shop,city,purpose,drawCap:cap,ratePct:rate,termDays:term,status,onTimeLoans,
-    listingLock:{who:shop,qak:R.LISTING_LOCK_QAK},shopHoldingQak:R.LISTING_LOCK_QAK,holdingVerified:false,sample:true,...o});
-  return { pools:[
-    p("p1","Kostas Bakery","Athens","stock",3000,9,60,"listed",1,{firstLoss:[{who:"holder-a",qak:400000}]}),
-    p("p2","Marina Fit Studio","Thessaloniki","fit-out",6750,11,120,"drawn",3,{totalDeposits:6750,deposits:{seed:6750},drawn:6750,firstLoss:[{who:"holder-b",qak:900000}]}),
-    p("p3","Lefkada Surf Shop","Lefkada","stock",3000,10,45,"repaying",1,{totalDeposits:3000,deposits:{seed:3000},drawn:3000,repaid:1200,firstLoss:[{who:"holder-c",qak:400000}]}),
-    p("p4","Psiri Records","Athens","fit-out",2000,12,90,"applied",0),
-  ], pot:{rlusd:0,qak:0}, protocolRevenue:0, queue:[] };
+// ---------- XLS-65.1.4: closed-ended vault phases ----------
+// Phase is derived from the parent ledger close time `now`; it is not stored.
+export function vaultPhase(v, now) {
+  if (!v || !v.VaultID) return "not created yet";
+  if (v.VaultKind !== SPEC.VaultKind.ClosedEnded) return "NoPhase";
+  if (now <= v.SubscriptionDate) return "Subscription";
+  if (now < v.RedemptionDate) return "Investment";
+  return "Redemption";
 }
-export function transition(s,id,to,note=""){ const p=pool(s,id); req(T[p.status].includes(to),`illegal ${p.status} -> ${to}`);
-  p.log.push(`${p.status} -> ${to} ${note}`.trim()); p.status=to; return p; }
+// VaultCreate data checks for a closed-ended vault (XLS-65 §3.2.5.1 #5, §3.2.5.2 #8-9).
+export function checkVaultDates(sub, red, now) {
+  req(Number.isInteger(sub) && Number.isInteger(red), "SubscriptionDate and RedemptionDate are required for VaultKind ClosedEnded (temMALFORMED)");
+  req(sub + SPEC.MIN_INVESTMENT_PERIOD <= red && red < sub + SPEC.MAX_INVESTMENT_PERIOD, "RedemptionDate - SubscriptionDate must be >= 180 s and < 946708560 s (temMALFORMED)");
+  if (now != null) { req(sub > now, "SubscriptionDate must be after the parent ledger close time (tecEXPIRED)"); req(red > now, "RedemptionDate must be after the parent ledger close time (tecEXPIRED)"); }
+  return true;
+}
+// VaultDeposit on a closed-ended vault fails when now > SubscriptionDate (tecEXPIRED, XLS-65 §3.5.2.2 #15).
+export function depositGate(v, now) {
+  const ph = vaultPhase(v, now);
+  if (ph === "Subscription" || ph === "NoPhase") return { ok: true };
+  if (ph === "not created yet") return { ok: false, reason: "No vault yet (VaultCreate not done)." };
+  return { ok: false, code: "tecEXPIRED", reason: `VaultDeposit only in the subscription window (phase now: ${ph}).` };
+}
+// LoanSet gates under LendingProtocolV1_1 (XLS-66 §3.8.5.2 #25-27 / XLS-66.1.2).
+export const loanMaturitySpan = (t) => t.PaymentInterval * t.PaymentTotal;
+export const latestLoanSetTime = (v, t) => v.RedemptionDate - loanMaturitySpan(t) - SPEC.LOAN_REDEMPTION_BUFFER;
+export function loanSetWindowGate(v, t, now) {
+  if (!v || !v.VaultID) return { ok: false, reason: "No vault yet (VaultCreate not done)." };
+  if (v.VaultKind !== SPEC.VaultKind.ClosedEnded) return { ok: false, reason: "Under LendingProtocolV1_1 the vault must be ClosedEnded." };
+  if (now <= v.SubscriptionDate) return { ok: false, code: "tecTOO_SOON", reason: "LoanSet only in the investment window: still in Subscription." };
+  if (now >= v.RedemptionDate) return { ok: false, code: "tecEXPIRED", reason: "LoanSet only in the investment window: Redemption has started." };
+  if (now + loanMaturitySpan(t) + SPEC.LOAN_REDEMPTION_BUFFER > v.RedemptionDate)
+    return { ok: false, code: "tecNO_PERMISSION", reason: "StartDate + PaymentInterval x PaymentTotal + 60 > RedemptionDate: the loan would mature too close to Redemption." };
+  return { ok: true };
+}
+// Planned dates for a vault created at `now` (app plan; fixed and immutable once VaultCreate succeeds).
+export function planDates(plan, now) {
+  const SubscriptionDate = now + plan.subscriptionDays * DAY, RedemptionDate = SubscriptionDate + plan.investmentDays * DAY;
+  checkVaultDates(SubscriptionDate, RedemptionDate, now); return { SubscriptionDate, RedemptionDate };
+}
+// Plan check: the full loan term must fit inside the investment window with the 60 s buffer (XLS-66.1.2 §3.2.2).
+export const planFits = (plan, t) => loanMaturitySpan(t) + SPEC.LOAN_REDEMPTION_BUFFER < plan.investmentDays * DAY;
 
-// Application: shop name, city, purpose, cap, rate, term and a 250,000 QAK listing lock (bought from the pool like any holder).
-// Requires a connected account (recorded). New applicants are first-time shops (0 on-time loans); history is not self-declared.
-const num=(v,label)=>{ req(v!==undefined&&v!==null&&String(v).trim()!=="",`${label} required`); const x=Number(v); req(Number.isFinite(x),`${label} must be a number`); return x; };
-export function apply(s,f){ reqAccount(f.account); const shop=cleanName(f.shop,"shop name"), city=cleanName(f.city,"city");
-  req(["stock","fit-out"].includes(f.purpose),"purpose must be stock or fit-out");
-  const cap=num(f.drawCap,"draw cap"), max=capForHistory(0);
-  req(Number.isInteger(cap)&&cap>=1&&cap<=max,`cap must be a whole number 1..${max} RLUSD for this shop (first-time shops: ${R.INITIAL_CAP_RLUSD})`);
-  const rate=num(f.ratePct,"interest rate"); req(rate>=L.RATE_MIN_PCT&&rate<=L.RATE_MAX_PCT,`interest rate must be ${L.RATE_MIN_PCT}..${L.RATE_MAX_PCT}% APR`);
-  const term=num(f.termDays,"term"); req(Number.isInteger(term)&&term>=L.TERM_MIN_DAYS&&term<=L.TERM_MAX_DAYS,`term must be a whole number of days, ${L.TERM_MIN_DAYS}..${L.TERM_MAX_DAYS}`);
-  const lock=num(f.listingLock,"listing lock"); req(isQak(lock),`QAK amounts must be whole numbers 1..${R.TOTAL_SUPPLY_QAK.toLocaleString()}`);
-  req(lock===R.LISTING_LOCK_QAK,`listing lock must be ${R.LISTING_LOCK_QAK.toLocaleString()} QAK`);
-  // QAK held comes from the ledger (account_lines), passed in by the app, never from the form. Preview/unconnected = 0.
-  const held=Number(f.ledgerQak)||0; req(held>=0&&held<=R.TOTAL_SUPPLY_QAK,"bad ledger balance");
-  req(lock<=held,`listing lock (${lock.toLocaleString()} QAK) must be covered by your QAK balance (ledger): ${held.toLocaleString()} QAK`);
-  const p={...blank(),id:newId(),shop,city,purpose:f.purpose,drawCap:cap,ratePct:rate,termDays:term,status:"applied",onTimeLoans:0,
-    account:f.account,listingLock:{who:f.account,qak:lock},shopHoldingQak:held,holdingVerified:f.ledgerVerified===true,sample:false,log:["applied by "+f.account]};
-  s.pools.push(p); return p; }
+// ---------- XLS-66 §3.8.5.1: LoanSet data verification ----------
+export function validateLoanTerms(t) {
+  const e = [];
+  if (!(Number(t.PrincipalRequested) > 0)) e.push("PrincipalRequested <= 0 (temINVALID)");
+  if (!(Number.isInteger(t.PaymentTotal) && t.PaymentTotal > 0)) e.push("PaymentTotal <= 0 (temINVALID)");
+  if (!(Number.isInteger(t.PaymentInterval) && t.PaymentInterval >= SPEC.MIN_PAYMENT_INTERVAL)) e.push("PaymentInterval is less than 60 seconds (temINVALID)");
+  if (!(Number.isInteger(t.GracePeriod) && t.GracePeriod >= SPEC.MIN_GRACE_PERIOD && t.GracePeriod <= t.PaymentInterval)) e.push("GracePeriod is less than 60 seconds or greater than the PaymentInterval (temINVALID)");
+  if (!(Number.isInteger(t.InterestRate) && t.InterestRate >= 0 && t.InterestRate <= SPEC.MAX_RATE)) e.push("InterestRate exceeds maximum allowed value (temINVALID)");
+  return e;
+}
 
-// Load-time validation of stored state (localStorage is untrusted). Bad pools are dropped; strings are type/length checked.
-const okStr=(x,max)=>typeof x==="string"&&x.length<=max;
-const okNum=(x)=>typeof x==="number"&&Number.isFinite(x);
-function okPool(p){ return p&&typeof p==="object"&&okStr(p.id,64)&&/^[A-Za-z0-9_-]+$/.test(p.id)&&okStr(p.shop,L.NAME_MAX)&&p.shop.trim()&&okStr(p.city,L.NAME_MAX)&&p.city.trim()
-  &&["stock","fit-out"].includes(p.purpose)&&STATUSES.includes(p.status)&&["drawCap","ratePct","termDays","totalDeposits","drawn","repaid"].every(k=>okNum(p[k]))
-  &&p.drawCap>0&&p.drawCap<=R.MAX_CAP_RLUSD&&p.ratePct>=L.RATE_MIN_PCT&&p.ratePct<=L.RATE_MAX_PCT&&p.termDays>=L.TERM_MIN_DAYS&&p.termDays<=L.TERM_MAX_DAYS
-  &&p.deposits&&typeof p.deposits==="object"&&Array.isArray(p.firstLoss)&&p.firstLoss.every(x=>x&&okStr(x.who,64)&&isQak(x.qak))
-  &&Array.isArray(p.log)&&p.log.every(l=>okStr(l,L.LOG_MAX))&&p.listingLock&&okNum(p.listingLock.qak)&&p.votes&&okNum(p.votes.yes)&&okNum(p.votes.no)
-  &&(p.account===undefined||isAccount(p.account))&&(p.shopHoldingQak===null||p.shopHoldingQak===undefined||isQak(p.shopHoldingQak)); }
-export function sanitizeState(raw){ if(!raw||typeof raw!=="object"||!Array.isArray(raw.pools)) return null;
-  const pools=raw.pools.filter(okPool).map(p=>({...p,holdingVerified:false,voters:Array.isArray(p.voters)?p.voters.filter(v=>v&&okStr(v.who,64)):[]}));
-  const ids=new Set(); const uniq=pools.filter(p=>!ids.has(p.id)&&ids.add(p.id));
-  const queue=Array.isArray(raw.queue)?raw.queue.filter(q=>q&&okStr(q.who,64)&&okStr(q.id,64)&&okNum(q.amt)&&okNum(q.qakLocked)):[];
-  const pot=raw.pot&&okNum(raw.pot.rlusd)&&okNum(raw.pot.qak)?raw.pot:{rlusd:0,qak:0};
-  return { pools:uniq, pot, protocolRevenue:okNum(raw.protocolRevenue)?raw.protocolRevenue:0, queue }; }
+// ---------- XLS-66 Appendix A-2: amortization, management fee, InterestDue ----------
+export function loanMath(principal, t, managementFeeRate) {
+  const r = tenthBps(t.InterestRate) * t.PaymentInterval / SPEC.SECONDS_PER_YEAR;          // (1)
+  const n = t.PaymentTotal;
+  const periodicPayment = r === 0 ? principal / n : principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1); // (5)-(7)
+  const totalValue = periodicPayment * n;                                                       // (30)
+  const interestGross = totalValue - principal;                                                 // (31)
+  const managementFee = interestGross * tenthBps(managementFeeRate);                            // (32)
+  const interestDue = interestGross - managementFee;                                            // (33): interest owed to the Vault
+  return { periodicRate: r, periodicPayment, totalValue, interestGross, managementFee, interestDue };
+}
+// InterestDue per unit of principal (linear in principal).
+export const interestFactor = (t, fee) => loanMath(1, t, fee).interestDue;
+// Fee rate used for cap math before the broker exists: the lower fee gives the higher InterestDue, so the bound is conservative.
+export const capMathFeeRate = (pool) => pool?.ledger?.ManagementFeeRate ?? R.FEE_RATE_DISCOUNT;
 
-// Votes: one QAK = one vote, on listing and on draw cap only.
-export function vote(s,id,yes,qak,who){ reqAccount(who); const p=pool(s,id); req(p.status==="applied","voting only while applied"); qak=Number(qak); req(isQak(qak),"QAK weight must be a whole number 1..1,000,000,000");
-  p.votes[yes?"yes":"no"]+=qak; (p.voters=p.voters||[]).push({who,yes:!!yes,qak});
-  if(p.votes.yes>=R.LIST_VOTE_THRESHOLD_QAK && p.votes.yes>p.votes.no){
-    const best=Object.entries(p.capVotes).sort((a,b)=>b[1]-a[1])[0]; if(best && best[1]>p.votes.yes) p.drawCap=Number(best[0]);
-    transition(s,id,"listed",`(QAK vote passed; cap ${p.drawCap})`); }
-  return p; }
-export function voteCap(s,id,cap,qak,who){ reqAccount(who); qak=Number(qak); req(isQak(qak),"QAK weight must be a whole number 1..1,000,000,000"); const p=pool(s,id); req(p.status==="applied","cap votes only while applied"); cap=Number(cap);
-  req(cap>0&&cap<=maxCap(p),`cap vote must be 1..${maxCap(p)}`); p.capVotes[cap]=(p.capVotes[cap]||0)+Number(qak); return p; }
+// Max principal under AssetsMaximum and DebtMaximum (XLS-66 §3.8.5.2 #6, #13, #14, #19). `s` is the live (or planned) vault/broker state.
+// #6  AssetsMaximum != 0 and AssetsTotal >= AssetsMaximum -> tecLIMIT_EXCEEDED
+// #13 AssetsAvailable < PrincipalRequested -> tecINSUFFICIENT_FUNDS
+// #14 AssetsMaximum != 0 and AssetsTotal + InterestDue > AssetsMaximum -> tecLIMIT_EXCEEDED
+// #19 DebtMaximum != 0 and DebtMaximum < DebtTotal + PrincipalRequested + InterestDue -> tecLIMIT_EXCEEDED
+export function maxPrincipal(s, t, fee) {
+  const k = interestFactor(t, fee), AM = Number(s.AssetsMaximum) || 0, DM = Number(s.DebtMaximum) || 0;
+  const AT = Number(s.AssetsTotal) || 0, AA = Number(s.AssetsAvailable) || 0, DT = Number(s.DebtTotal) || 0;
+  if (AM && AT >= AM) return { max: 0, k, reason: "AssetsTotal >= AssetsMaximum (vault at capacity): LoanSet fails (tecLIMIT_EXCEEDED)" };
+  let max = AA, why = "AssetsAvailable";
+  if (AM && k > 0 && (AM - AT) / k < max) { max = (AM - AT) / k; why = "AssetsTotal + InterestDue <= AssetsMaximum"; }
+  if (DM && (DM - DT) / (1 + k) < max) { max = (DM - DT) / (1 + k); why = "DebtTotal + PrincipalRequested + InterestDue <= DebtMaximum"; }
+  max = Math.max(0, floorCents(max - R.ROUNDING_MARGIN));
+  return { max, k, reason: why };
+}
+// Planning view for a fresh vault with AssetsMaximum = DebtMaximum = cap: lenders fill exactly the principal, then LoanSet.
+// The largest principal P satisfies P + InterestDue(P) <= cap, i.e. P <= cap / (1 + k).
+export function planUnderCap(cap, t, fee) {
+  const k = interestFactor(t, fee);
+  const max = Math.max(0, floorCents(cap / (1 + k) - R.ROUNDING_MARGIN));
+  const m = loanMath(max, t, fee);
+  return { cap, k, maxPrincipal: max, interestDue: m.interestDue, depositTarget: max, debtAtLoanSet: max + m.interestDue,
+    fullCapFails: loanSetCapCheck({ AssetsMaximum: cap, DebtMaximum: cap, AssetsTotal: cap, AssetsAvailable: cap, DebtTotal: 0 }, cap, t, fee) };
+}
+// The cap checks LoanSet runs (returns the first failing check or ok).
+export function loanSetCapCheck(s, principal, t, fee) {
+  const I = loanMath(principal, t, fee).interestDue, AM = Number(s.AssetsMaximum) || 0, DM = Number(s.DebtMaximum) || 0;
+  if (AM && s.AssetsTotal >= AM) return { ok: false, code: "tecLIMIT_EXCEEDED", check: 6, reason: "AssetsTotal >= AssetsMaximum (vault at capacity)" };
+  if (s.AssetsAvailable < principal) return { ok: false, code: "tecINSUFFICIENT_FUNDS", check: 13, reason: "AssetsAvailable < PrincipalRequested" };
+  if (AM && s.AssetsTotal + I > AM) return { ok: false, code: "tecLIMIT_EXCEEDED", check: 14, reason: "AssetsTotal + InterestDue > AssetsMaximum" };
+  if (DM && DM < (Number(s.DebtTotal) || 0) + principal + I) return { ok: false, code: "tecLIMIT_EXCEEDED", check: 19, reason: "DebtMaximum < DebtTotal + PrincipalRequested + InterestDue" };
+  return { ok: true, interestDue: I };
+}
 
-// First-loss: any holder locks QAK under one named pool before the draw; cannot be pulled while the loan is open.
-export function lockFirstLoss(s,id,who,qak){ reqAccount(who); const p=pool(s,id); req(["applied","listed"].includes(p.status),"first-loss must be posted before the draw");
-  qak=Number(qak); req(isQak(qak),"QAK amount must be a whole number 1..1,000,000,000"); p.firstLoss.push({who,qak}); return p; }
-export function unlockFirstLoss(s,id,who){ const p=pool(s,id); req(["applied","listed"].includes(p.status),"lock cannot be pulled while the loan is open");
-  p.firstLoss=p.firstLoss.filter(x=>x.who!==who); return p; }
+// ---------- XLS-66 §3.1.11 / §3.8.5.2 #20 / §3.10.5: first-loss capital (cover) ----------
+// LoanSet needs CoverAvailable >= (DebtTotal + PrincipalRequested + InterestDue) x CoverRateMinimum.
+export const coverRequired = (debtTotal, principal, interestDue, crm) => (debtTotal + principal + interestDue) * tenthBps(crm);
+// On LoanManage tfLoanDefault: DefaultCovered = min(DebtTotal x CoverRateMinimum x CoverRateLiquidation, DefaultAmount, CoverAvailable).
+export function defaultCover({ DebtTotal, CoverRateMinimum, CoverRateLiquidation, CoverAvailable, DefaultAmount }) {
+  const minimumCover = DebtTotal * tenthBps(CoverRateMinimum);
+  const covered = Math.min(minimumCover * tenthBps(CoverRateLiquidation), DefaultAmount, CoverAvailable);
+  return { minimumCover, defaultCovered: covered, vaultLoss: DefaultAmount - covered };
+}
 
-export function deposit(s,id,who,amt){ const p=pool(s,id); amt=Number(amt); req(p.status==="listed","deposits only into listed pools"); req(amt>0,"bad amount");
-  const room=p.drawCap-p.totalDeposits; req(room>0,"pool full; join queue"); amt=Math.min(amt,room);
-  p.deposits[who]=(p.deposits[who]||0)+amt; p.totalDeposits+=amt; return amt; }
-// Queue: locked QAK orders the queue when a pool is full. It does not reserve a fill.
-export function enqueue(s,who,id,amt,qakLocked){ s.queue.push({who,id,amt:Number(amt),qakLocked:Number(qakLocked)||0});
-  s.queue.sort((a,b)=>b.qakLocked-a.qakLocked); return s.queue; }
+// ---------- XLS-66 §3.10 / §3.11 / §3.9: loan servicing gates (fixCleanup3_4_0 boundaries) ----------
+// LoanPay: on time needs Amount >= periodicPayment + LoanServiceFee; late (now > NextPaymentDueDate) needs tfLoanLatePayment.
+export function loanPayCheck(loan, amount, late, now) {
+  if (!loan || loan.PaymentRemaining === 0) return { ok: false, code: "tecKILLED", reason: "Loan is already fully paid or defaulted." };
+  const isLate = now > loan.NextPaymentDueDate;
+  if (isLate && !late) return { ok: false, code: "tecEXPIRED", reason: "Payment is late: tfLoanLatePayment is required." };
+  const due = Number(loan.PeriodicPayment) + (Number(loan.LoanServiceFee) || 0) + (isLate ? (Number(loan.LatePaymentFee) || 0) : 0);
+  if (isLate && (Number(loan.LateInterestRate) || 0) > 0 && amount < due) return { ok: false, code: "tecINSUFFICIENT_PAYMENT", reason: "Below periodic payment + fees (late interest is computed by the ledger on top)." };
+  if (amount < due) return { ok: false, code: "tecINSUFFICIENT_PAYMENT", reason: `Below the fixed installment (${due}). Partial repayments are not possible.` };
+  return { ok: true, late: isLate };
+}
+// LoanManage tfLoanImpair: only when now > NextPaymentDueDate (fixCleanup3_4_0, XLS-66 §3.10.4.2 #9).
+export function impairGate(loan, now) {
+  if (!loan || loan.PaymentRemaining === 0) return { ok: false, code: "tecNO_PERMISSION", reason: "Loan is settled or defaulted." };
+  if (loan.Flags & 0x00010000) return { ok: false, code: "tecNO_PERMISSION", reason: "Loan is defaulted." };
+  if (loan.Flags & 0x00020000) return { ok: false, code: "tecNO_PERMISSION", reason: "Loan is already impaired." };
+  if (now <= loan.NextPaymentDueDate) return { ok: false, code: "tecTOO_SOON", reason: "Impairment only after a payment is overdue." };
+  return { ok: true };
+}
+// LoanManage tfLoanDefault: only when now > NextPaymentDueDate + GracePeriod (fixCleanup3_4_0, §3.10.4.2 #6), by LoanBroker.Owner.
+export function defaultGate(loan, now) {
+  if (!loan || loan.PaymentRemaining === 0) return { ok: false, code: "tecNO_PERMISSION", reason: "Loan is settled or defaulted." };
+  if (loan.Flags & 0x00010000) return { ok: false, code: "tecNO_PERMISSION", reason: "Loan is already defaulted." };
+  if (now <= loan.NextPaymentDueDate + loan.GracePeriod) return { ok: false, code: "tecTOO_SOON", reason: "Default only after NextPaymentDueDate + GracePeriod." };
+  return { ok: true };
+}
+// LoanDelete: only when PaymentRemaining == 0 (settled or defaulted), §3.9.3.2 #2.
+export const deleteGate = (loan) => (loan && loan.PaymentRemaining === 0 ? { ok: true } : { ok: false, code: "tecHAS_OBLIGATIONS", reason: "Loan still has payments remaining." });
 
-export function draw(s,id,snapshotPrice){ const p=pool(s,id); req(!p.frozen,"draws frozen: overdue payment"); req(p.totalDeposits>0,"no deposits");
-  req(p.totalDeposits<=maxCap(p),"exceeds shop max cap");
-  const min=minFirstLossQak(p.totalDeposits,snapshotPrice); req(firstLossQak(p)>=min,`first-loss below minimum: need ${min} QAK at snapshot ${snapshotPrice}`);
-  p.drawn=p.totalDeposits; p.drawSnapshotPrice=snapshotPrice; return transition(s,id,"drawn"); }
+// ---------- Network / amendment gate ----------
+// Deposits and LoanSet stay disabled until ALL THREE required amendments are enabled on that network. Mainnet is hard-off.
+export function networkGate(net, features, asset) {
+  const n = NETWORKS[net]; const reasons = [];
+  if (!n) return { ok: false, reasons: ["Unknown network."] };
+  if (!n.vaultLending) reasons.push(n.offReason);
+  if (!features) reasons.push(`${n.label}: amendment status not checked yet.`);
+  else for (const a of AMENDMENTS.required) if (features[a] !== true) reasons.push(`${n.label}: ${a} is not enabled.`);
+  const iss = (asset || n.asset).issuer;
+  if (!iss) reasons.push(net === "devnet" ? "Devnet: no test-issuer set. RLUSD does not exist on devnet; set VITE_DEVNET_TEST_ISSUER to a self-issued test IOU issuer." : `${n.label}: no asset issuer set.`);
+  return { ok: reasons.length === 0, reasons };
+}
 
-// Fee: 1.00% (or 0.75% for >=100,000 QAK held) of INTEREST paid, in RLUSD. Half to cover pot.
-export function repay(s,id,amt){ const p=pool(s,id); const owed=owedOf(p); const paid=Math.min(Number(amt),owed-p.repaid); req(paid>0,"nothing owed");
-  p.repaid+=paid; const interestPart=+(paid*interestOf(p)/owed).toFixed(6); p.interestPaid+=interestPart;
-  const fee=interestPart*poolFeeBps(p)/1e4; s.pot.rlusd+=fee*R.COVER_SHARE_OF_FEES; s.protocolRevenue+=fee*(1-R.COVER_SHARE_OF_FEES);
-  if(p.status==="late"){ p.overdue=Math.max(0,+(p.overdue-paid).toFixed(2)); if(p.overdue>0){ p.log.push(`partial overdue payment ${paid}; still frozen`); return p; }
-    p.frozen=false; p.lateSince=null; p.log.push("overdue cleared; draw freeze lifted"); }
-  if(p.repaid>=owed){ p.onTimeLoans=p.hadLate?0:(p.onTimeLoans||0)+1;
-    p.log.push(`repaid: lenders paid first; first-loss lock (${firstLossQak(p)} QAK) and listing lock released`+(p.hadLate?"; cap growth reset":""));
-    p.releasedFirstLoss=p.firstLoss; p.firstLoss=[]; return transition(s,id,"repaid"); }
-  return transition(s,id,"repaying"); }
-export function missPayment(s,id,overdueAmt,day=today()){ const p=pool(s,id); overdueAmt=Number(overdueAmt); req(overdueAmt>0,"overdue amount required");
-  transition(s,id,"late","(missed repayment; draws frozen)"); p.frozen=true; p.hadLate=true; p.overdue=overdueAmt; p.lateSince=day; return p; }
+// ---------- QAK app rules ----------
+// Fee cut: ManagementFeeRate is fixed at LoanBrokerSet, so the QAK balance check happens once, at broker creation.
+export const feeRateAtBrokerCreation = (ledgerQak) => ((Number(ledgerQak) || 0) >= R.DISCOUNT_MIN_HOLDING_QAK ? R.FEE_RATE_DISCOUNT : R.FEE_RATE);
+export const feePct = (rate) => (rate / 1000).toFixed(2); // 1000 (1/10 bps) = 1.00%
 
-// Default: shortfall takes first-loss QAK (valued at snapshot) before lenders; listing lock treated as seized -> pot;
-// pot pays only up to its RLUSD balance, then stops; anything still unpaid stays in this pool.
-export function declareDefault(s,id,snapshotPrice,day=today()){ const p=pool(s,id); req(p.status==="late","only late pools");
-  req(daysLate(p,day)>=R.DEFAULT_GRACE_DAYS,`grace period: ${R.DEFAULT_GRACE_DAYS} days late required`); req(snapshotPrice>=0,"snapshot price required");
-  transition(s,id,"defaulted"); const shortfall=+Math.max(0,owedOf(p)-p.repaid).toFixed(2);
-  const flQak=firstLossQak(p), flValue=flQak*snapshotPrice, fromFirstLoss=Math.min(flValue,shortfall);
-  const flTaken=snapshotPrice>0?Math.min(flQak,Math.ceil(fromFirstLoss/snapshotPrice)):0;
-  const listingSeized=p.listingLock.qak; s.pot.qak+=listingSeized; p.listingLock.qak=0; p.firstLoss=[]; // first-loss remainder above shortfall is released
-  const afterFl=+(shortfall-fromFirstLoss).toFixed(2); const fromPot=Math.min(s.pot.rlusd,afterFl); s.pot.rlusd-=fromPot;
-  const lenderLoss=+(afterFl-fromPot).toFixed(2);
-  p.log.push(`default: shortfall ${shortfall}; first-loss ${flTaken} QAK treated as seized (${fromFirstLoss.toFixed(2)} RLUSD at ${snapshotPrice}); listing lock ${listingSeized} QAK treated as seized -> pot; pot paid ${fromPot.toFixed(2)}; lender loss ${lenderLoss} stays in this pool`);
-  return { shortfall, flTaken, fromFirstLoss, listingSeized, fromPot, lenderLoss }; }
+// ---------- Off-ledger app state ----------
+export const STAGES = ["applied", "listed"]; // off-ledger stages; after "listed" the ledger objects define the state
+export const PREVIEW_ACCOUNT = "rPREVIEWxxxxxxxxxxxxxxxxxxxxxxxxx";
+export const isAccount = (who) => typeof who === "string" && (who === PREVIEW_ACCOUNT || /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(who));
+const reqAccount = (who) => req(isAccount(who), "connect a Xaman account first");
+const isQak = (x) => Number.isInteger(x) && x > 0 && x <= R.TOTAL_SUPPLY_QAK;
+const isId = (x) => x === null || (typeof x === "string" && /^[0-9A-F]{64}$/.test(x));
+const isTime = (x) => x === null || (Number.isInteger(x) && x > 0);
+const newId = () => "p_" + (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const cleanName = (v, label) => { const t = String(v ?? "").trim(); req(t.length > 0, `${label} required`); req(t.length <= L.NAME_MAX, `${label}: max ${L.NAME_MAX} characters`); return t; };
+const num = (v, label) => { req(v !== undefined && v !== null && String(v).trim() !== "", `${label} required`); const x = Number(v); req(Number.isFinite(x), `${label} must be a number`); return x; };
+const blankLedger = () => ({ VaultID: null, LoanBrokerID: null, LoanID: null, ShareMPTID: null, SubscriptionDate: null, RedemptionDate: null, ManagementFeeRate: null });
+const base = () => ({ votes: { yes: 0, no: 0 }, capVotes: {}, voters: [], log: [], ledger: blankLedger() });
+
+export function seed() {
+  const f = FIRST_POOL;
+  return { pools: [{ ...base(), id: f.id, shop: f.shop, city: f.city, purpose: f.purpose, sample: true, network: f.network, stage: f.stage,
+    capRlusd: f.capRlusd, terms: { ...f.terms }, plan: { ...f.plan }, account: null,
+    listingLock: { who: null, qak: R.LISTING_LOCK_QAK }, shopHoldingQak: null, holdingVerified: false }], queue: [] };
+}
+
+// Application (off-ledger). The cap becomes AssetsMaximum and DebtMaximum; the terms become LoanSet fields.
+export function apply(s, f) {
+  reqAccount(f.account); const shop = cleanName(f.shop, "shop name"), city = cleanName(f.city, "city");
+  req(["stock", "fit-out"].includes(f.purpose), "purpose must be stock or fit-out");
+  const cap = num(f.capRlusd, "cap"); req(Number.isInteger(cap) && cap >= 1 && cap <= R.MAX_CAP_RLUSD, `cap must be a whole number 1..${R.MAX_CAP_RLUSD.toLocaleString("en-US")} RLUSD`);
+  const rate = num(f.ratePct, "interest rate"); req(rate >= L.RATE_MIN_PCT && rate <= L.RATE_MAX_PCT, `interest rate must be ${L.RATE_MIN_PCT}..${L.RATE_MAX_PCT}% APR`);
+  const pt = num(f.paymentTotal, "number of payments"); req(Number.isInteger(pt) && pt >= L.PAYMENTS_MIN && pt <= L.PAYMENTS_MAX, `number of payments must be a whole number ${L.PAYMENTS_MIN}..${L.PAYMENTS_MAX}`);
+  const iv = num(f.intervalDays, "payment interval"); req(Number.isInteger(iv) && iv >= L.INTERVAL_MIN_DAYS && iv <= L.INTERVAL_MAX_DAYS, `payment interval must be a whole number of days ${L.INTERVAL_MIN_DAYS}..${L.INTERVAL_MAX_DAYS}`);
+  req(pt * iv <= L.TERM_MAX_DAYS, `term (payments x interval) must be at most ${L.TERM_MAX_DAYS} days`);
+  const gr = num(f.graceDays, "grace period"); req(Number.isInteger(gr) && gr >= 1, "grace period must be a whole number of days, at least 1");
+  req(gr <= iv, "grace period must not exceed the payment interval (GracePeriod <= PaymentInterval)");
+  const lock = num(f.listingLock, "listing lock"); req(isQak(lock), `QAK amounts must be whole numbers 1..${R.TOTAL_SUPPLY_QAK.toLocaleString("en-US")}`);
+  req(lock === R.LISTING_LOCK_QAK, `listing lock must be ${R.LISTING_LOCK_QAK.toLocaleString("en-US")} QAK`);
+  const held = Number(f.ledgerQak) || 0; req(held >= 0 && held <= R.TOTAL_SUPPLY_QAK, "bad ledger balance");
+  req(lock <= held, `listing lock (${lock.toLocaleString("en-US")} QAK) must be covered by your QAK balance (ledger): ${held.toLocaleString("en-US")} QAK`);
+  const terms = { InterestRate: Math.round(rate * 1000), PaymentTotal: pt, PaymentInterval: iv * DAY, GracePeriod: gr * DAY };
+  const errs = validateLoanTerms({ ...terms, PrincipalRequested: cap }); req(errs.length === 0, errs.join("; "));
+  const plan = { subscriptionDays: FIRST_POOL.plan.subscriptionDays, investmentDays: pt * iv + gr + 3 }; // app rule: term + grace + 3 days margin
+  req(planFits(plan, terms), "loan term does not fit the investment window");
+  const p = { ...base(), id: newId(), shop, city, purpose: f.purpose, sample: false, network: "devnet", stage: "applied", capRlusd: cap, terms, plan,
+    account: f.account, listingLock: { who: f.account, qak: lock }, shopHoldingQak: held, holdingVerified: f.ledgerVerified === true, log: ["applied by " + f.account] };
+  s.pools.push(p); return p;
+}
+
+// Votes: one QAK = one vote, on the listing and the cap only (app rule, off-ledger).
+const pool = (s, id) => { const p = s.pools.find((x) => x.id === id); req(p, "no pool"); return p; };
+export function vote(s, id, yes, qak, who) {
+  reqAccount(who); const p = pool(s, id); req(p.stage === "applied", "voting only while applied"); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000");
+  p.votes[yes ? "yes" : "no"] += qak; p.voters.push({ who, yes: !!yes, qak });
+  if (p.votes.yes >= R.LIST_VOTE_THRESHOLD_QAK && p.votes.yes > p.votes.no) {
+    const best = Object.entries(p.capVotes).sort((a, b) => b[1] - a[1])[0]; if (best && best[1] > p.votes.yes) p.capRlusd = Number(best[0]);
+    p.stage = "listed"; p.log.push(`listed by QAK vote; cap ${p.capRlusd} RLUSD`); }
+  return p;
+}
+export function voteCap(s, id, cap, qak, who) {
+  reqAccount(who); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000"); const p = pool(s, id); req(p.stage === "applied", "cap votes only while applied");
+  cap = Number(cap); req(Number.isInteger(cap) && cap > 0 && cap <= R.MAX_CAP_RLUSD, `cap vote must be 1..${R.MAX_CAP_RLUSD}`); p.capVotes[cap] = (p.capVotes[cap] || 0) + qak; return p;
+}
+// Queue: locked QAK orders the Duck Bank deposit queue (app rule). The vault itself is public: the ledger accepts any VaultDeposit during Subscription.
+export function enqueue(s, who, id, amt, qakLocked) {
+  reqAccount(who); pool(s, id); amt = Number(amt); req(amt > 0, "bad amount");
+  s.queue.push({ who, id, amt, qakLocked: Number(qakLocked) || 0 }); s.queue.sort((a, b) => b.qakLocked - a.qakLocked); return s.queue;
+}
+// Record ledger ids after a validated transaction. One shop per vault: a pool's VaultID, LoanBrokerID and LoanID are set once.
+export function recordLedger(s, id, field, value) {
+  const p = pool(s, id); req(["VaultID", "LoanBrokerID", "LoanID", "ShareMPTID", "SubscriptionDate", "RedemptionDate", "ManagementFeeRate"].includes(field), "bad field");
+  req(p.ledger[field] == null, `${field} already set for this shop`);
+  if (field === "VaultID") req(!s.pools.some((q) => q.ledger.VaultID === value), "this vault already belongs to another shop");
+  p.ledger[field] = value; p.log.push(`${field} = ${value}`); return p;
+}
+
+// Load-time validation of stored state (localStorage is untrusted). Bad pools are dropped.
+const okStr = (x, max) => typeof x === "string" && x.length <= max;
+const okNum = (x) => typeof x === "number" && Number.isFinite(x);
+function okPool(p) {
+  return p && typeof p === "object" && okStr(p.id, 64) && /^[A-Za-z0-9_-]+$/.test(p.id) && okStr(p.shop, L.NAME_MAX) && p.shop.trim() && okStr(p.city, L.NAME_MAX) && p.city.trim()
+    && ["stock", "fit-out"].includes(p.purpose) && STAGES.includes(p.stage) && Object.hasOwn(NETWORKS, p.network)
+    && okNum(p.capRlusd) && p.capRlusd > 0 && p.capRlusd <= R.MAX_CAP_RLUSD
+    && p.terms && validateLoanTerms({ ...p.terms, PrincipalRequested: 1 }).length === 0 && p.terms.InterestRate <= L.RATE_MAX_PCT * 1000
+    && p.plan && Number.isInteger(p.plan.subscriptionDays) && p.plan.subscriptionDays > 0 && Number.isInteger(p.plan.investmentDays) && planFits(p.plan, p.terms)
+    && p.ledger && ["VaultID", "LoanBrokerID", "LoanID"].every((k) => isId(p.ledger[k])) && (p.ledger.ShareMPTID === null || (typeof p.ledger.ShareMPTID === "string" && /^[0-9A-F]{48}$/.test(p.ledger.ShareMPTID)))
+    && isTime(p.ledger.SubscriptionDate) && isTime(p.ledger.RedemptionDate) && [null, R.FEE_RATE, R.FEE_RATE_DISCOUNT].includes(p.ledger.ManagementFeeRate)
+    && Array.isArray(p.log) && p.log.every((l) => okStr(l, L.LOG_MAX)) && p.listingLock && okNum(p.listingLock.qak) && p.votes && okNum(p.votes.yes) && okNum(p.votes.no)
+    && p.capVotes && typeof p.capVotes === "object" && (p.account === null || p.account === undefined || isAccount(p.account))
+    && (p.shopHoldingQak === null || p.shopHoldingQak === undefined || okNum(p.shopHoldingQak));
+}
+export function sanitizeState(raw) {
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.pools)) return null;
+  const pools = raw.pools.filter(okPool).map((p) => ({ ...p, holdingVerified: false, voters: Array.isArray(p.voters) ? p.voters.filter((v) => v && okStr(v.who, 64)) : [] }));
+  const ids = new Set(), vaults = new Set();
+  const uniq = pools.filter((p) => { if (ids.has(p.id)) return false; if (p.ledger.VaultID && vaults.has(p.ledger.VaultID)) return false; ids.add(p.id); if (p.ledger.VaultID) vaults.add(p.ledger.VaultID); return true; });
+  const queue = Array.isArray(raw.queue) ? raw.queue.filter((q) => q && okStr(q.who, 64) && okStr(q.id, 64) && okNum(q.amt) && okNum(q.qakLocked)) : [];
+  return { pools: uniq, queue };
+}

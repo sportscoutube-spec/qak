@@ -1,6 +1,7 @@
-// Read-only mainnet ledger reads for QAK. No transactions are built or sent here.
-import { QAK_ISSUER, QAK_CURRENCY, LEDGER_RPC } from "./config.js";
-export const RIPPLE_EPOCH = 946684800;
+// Read-only ledger reads: QAK issuer/balances (mainnet), amendment status via the `feature` RPC (per network),
+// and Vault/LoanBroker/Loan entries by id. No transactions are built or sent here.
+import { QAK_ISSUER, QAK_CURRENCY, LEDGER_RPC, NETWORKS, AMENDMENTS, RIPPLE_EPOCH } from "./config.js";
+export { RIPPLE_EPOCH };
 export const BLACKHOLES = ["rrrrrrrrrrrrrrrrrrrrrhoLvTp","rrrrrrrrrrrrrrrrrrrrBZbvji","rrrrrrrrrrrrrrrrrrrn5RM1rHd","rrrrrrrrrrrrrrrrrNAMEtxvNvQ"];
 export const FLAGS = { lsfRequireDestTag:0x00020000, lsfRequireAuth:0x00040000, lsfDisallowXRP:0x00080000, lsfDisableMaster:0x00100000,
   lsfNoFreeze:0x00200000, lsfGlobalFreeze:0x00400000, lsfDefaultRipple:0x00800000, lsfDepositAuth:0x01000000,
@@ -11,8 +12,8 @@ const NAMES = { lsfRequireDestTag:"RequireDestTag", lsfRequireAuth:"RequireAuth"
 export const flagNames=(f)=>Object.entries(FLAGS).filter(([,b])=>((f>>>0)&b)>>>0===b).map(([k])=>NAMES[k]);
 const isQak=(cur)=>cur===QAK_CURRENCY;
 
-export async function rpc(method, params, f=globalThis.fetch){
-  const r=await f(LEDGER_RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({method,params:[params]})});
+export async function rpc(method, params, f=globalThis.fetch, url=LEDGER_RPC){
+  const r=await f(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({method,params:[params]})});
   if(!r.ok) throw new Error(`${method}: HTTP ${r.status}`);
   const j=await r.json(); const res=j&&j.result; if(!res||res.status==="error"||res.error) throw new Error(`${method}: ${res?.error_message||res?.error||"bad response"}`);
   return res; }
@@ -41,3 +42,25 @@ export async function qakBalance(account, f=globalThis.fetch){
   const line=(res.lines||[]).find(l=>isQak(l.currency)&&l.account===QAK_ISSUER);
   if(!line) return { account, hasLine:false, balance:0, authorized:false };
   const b=Number(line.balance); return { account, hasLine:true, balance:Number.isFinite(b)&&b>0?b:0, authorized:!!line.peer_authorized, limit:String(line.limit) }; }
+
+// Amendment status on one network via the read-only `feature` RPC (no arguments: nothing is voted or changed).
+// Returns { SingleAssetVault: bool, ... } matched by amendment name, falling back to the known amendment ID.
+export async function featureStatus(net, f=globalThis.fetch){
+  const n=NETWORKS[net]; if(!n) throw new Error("unknown network");
+  const res=await rpc("feature",{},f,n.rpc); const feats=res.features||{}; const out={};
+  for(const name of [...AMENDMENTS.required,...AMENDMENTS.info]){
+    const byName=Object.values(feats).find(v=>v&&v.name===name); const v=byName||feats[AMENDMENTS.ids[name]];
+    out[name]=!!(v&&v.enabled===true); }
+  return out; }
+// Generic ledger_entry by object id on a network (Vault, LoanBroker, Loan).
+export async function ledgerEntry(net, index, f=globalThis.fetch){
+  if(!/^[0-9A-F]{64}$/.test(index||"")) throw new Error("bad ledger id");
+  const res=await rpc("ledger_entry",{index,ledger_index:"validated"},f,NETWORKS[net].rpc); return res.node; }
+// After a validated transaction: the LedgerIndex of the CreatedNode of a given type (e.g. "Vault", "LoanBroker", "Loan").
+export async function createdId(net, txid, type, f=globalThis.fetch){
+  if(!/^[0-9A-F]{64}$/.test(txid||"")) throw new Error("bad tx hash");
+  const res=await rpc("tx",{transaction:txid},f,NETWORKS[net].rpc);
+  if(!res.validated) throw new Error("transaction not validated yet");
+  const result=res.meta?.TransactionResult; if(result!=="tesSUCCESS") throw new Error("transaction result "+result);
+  const node=(res.meta.AffectedNodes||[]).map(x=>x.CreatedNode).find(c=>c&&c.LedgerEntryType===type);
+  if(!node) throw new Error("no created "+type); return node.LedgerIndex; }

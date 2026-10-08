@@ -1,77 +1,77 @@
-# QAK (v0.1 prototype)
+# Duck Bank (v0.2 prototype)
 
-Short working-capital loans to named shops on the XRP Ledger. Each retailer has one isolated pool. Lenders get a pool-share receipt for that shop only. **QAK** is the protocol token used for stakes, governance, fee discounts, queue priority and the default-cover pot. It is never the lent asset and never the lender receipt. **There is no buy tax.** Buys outside the app are untaxed. There is no guaranteed yield, and this code is **not audited**.
+Short loans to named shops on the XRP Ledger, built on XLS-65 (Single Asset Vault) and XLS-66 (Lending Protocol).
+One shop gets one closed-ended vault in RLUSD and one loan broker on that vault. Lenders deposit during the subscription
+window and hold **the vault MPT share**: the receipt for that shop only. **QAK** is the app token (listing lock, fee cut,
+queue order, votes). The code is **not audited**.
+
+Live: https://trustline-tan.vercel.app · Whitepaper: `public/qak-whitepaper.pdf` (served at `/qak-whitepaper.pdf`)
+
+## Status of the amendments
+XLS-65/66 need **SingleAssetVault, LendingProtocol and LendingProtocolV1_1**. A rippled release is not activation: an
+amendment counts only once validators enable it. The Status page (`#/status`) runs the read-only `feature` RPC on each network.
+Snapshot 2026-10-08 09:13 EEST: mainnet and testnet have none enabled; devnet has all three.
+
+- **Mainnet:** hard-off in `src/config.js` (`NETWORKS.mainnet.vaultLending = false`). No env switch turns it on. No mainnet deposits.
+- **Testnet:** status only.
+- **Devnet:** may call the real transactions once all three amendments read enabled and a test issuer is configured.
+  RLUSD does not exist on devnet, so the asset is a labelled test IOU from `VITE_DEVNET_TEST_ISSUER`. Unset, devnet actions stay disabled.
 
 ## Run
 ```
-cd /workspace/trustline
 npm install
 npm run dev        # http://localhost:5173
 npm run build && npm run preview   # http://localhost:4173
-npm test           # mock state-machine tests
+npm test           # spec math, gating, payload shapes, ledger reads
 ```
-Optional: `cp .env.example .env.local` and add your Xaman API key from https://apps.xaman.dev. Whitelist the redirect URI there. If no key is set, "Connect" uses a mock connected state.
+Optional: `cp .env.example .env.local`, add your Xaman API key from https://apps.xaman.dev and whitelist the redirect URI.
+Without a key, "Connect" uses a wallet labelled **mock** that signs nothing.
 
 ## Pages (hash routes)
-`#/` home · `#/apply` retailer form · `#/pools` list · `#/pool/<id>` detail plus mock lifecycle · `#/lend` lender panel · `#/trust` QAK roles · `#/status` amendment status (includes a live re-check button)
+`#/` home · `#/apply` shop application · `#/pools` list · `#/pool/<id>` ledger objects, cap math, transactions ·
+`#/lend` lender panel · `#/qak` QAK roles, tokenomics, team, roadmap (`#/trust` redirects here) · `#/whitepaper` · `#/status` amendments
 
-## Real vs mocked
-| Area | State |
-|---|---|
-| Xaman connect (Universal SDK `xumm`, OAuth2 PKCE in the browser) | Real when an API key is set, otherwise a mock |
-| Show address + network | Real (from `xumm.user.account` / `networkType`) or a mock |
-| Sign test payload | Real Xaman `SignIn` pseudo-transaction, which is never submitted to the ledger |
-| Deposits, draws, repayments, defaults | **Custodial demo** stored in browser localStorage. No funds move |
-| Stake seizure/burn on default | Mock state machine (`src/state.js`): listing + first-loss stake are seized, 50% is burned, 50% goes to the cover pot, and the loss is isolated to that pool |
-| XLS-65/66 transactions | **Feature-flagged OFF**: "waiting on amendment" |
-| Mainnet sends | Hard OFF |
+## Ledger model (per shop)
+1. **VaultCreate** on RLUSD: `VaultKind` 1 (ClosedEnded), `SubscriptionDate`, `RedemptionDate`, `AssetsMaximum` = cap, `Scale` 6
+   (IOU range 0-18), `tfVaultShareNonTransferable`. Shop name, city and purpose stay off-ledger.
+2. **LoanBrokerSet** on that VaultID: `DebtMaximum` = cap, `CoverRateMinimum` 15000 (15%), `CoverRateLiquidation` 100000,
+   `ManagementFeeRate` 1000 or 750 decided at creation (fixed afterwards).
+3. **LoanBrokerCoverDeposit**: the shop's RLUSD first-loss cover.
+4. **VaultDeposit**: only while now ≤ SubscriptionDate (later: `tecEXPIRED`).
+5. **LoanSet**: only in the investment window, signed by broker and shop (`CounterpartySignature`), and
+   StartDate + PaymentInterval × PaymentTotal + 60 s ≤ RedemptionDate. `GracePeriod` ≤ `PaymentInterval`.
+6. **LoanPay**: fixed installments (a smaller payment fails `tecINSUFFICIENT_PAYMENT`); late payments carry `tfLoanLatePayment`.
+7. **LoanManage**: `tfLoanImpair` once a payment is overdue; `tfLoanDefault` after NextPaymentDueDate + GracePeriod.
+   Cover paid = min(DebtTotal × CRM × CRL, DefaultAmount, CoverAvailable); the rest is written down on that vault only.
+8. **LoanDelete** once PaymentRemaining is 0. Never a second shop on one vault.
 
-Statuses: applied → listed → drawn → repaying/late → repaid/defaulted. Seed shops: Kostas Bakery (Athens), Marina Fit Studio (Thessaloniki), Lefkada Surf Shop, Psiri Records (Athens).
+Builders: `src/payloads.js`. Gates and formulas: `src/state.js`. Ledger reads: `src/ledger.js`.
 
-## Amendment gate (checked 2026-10-07 10:33 EEST)
-Method: `ledger_entry` for the Amendments singleton (`7DB0788C…6EF4`) on a validated ledger.
-| Amendment | Mainnet (xrplcluster.com) | Testnet (s.altnet) | Devnet (s.devnet) |
-|---|---|---|---|
-| SingleAssetVault (XLS-65) `81BD2619…240D8` | not enabled, no majority | not enabled, no majority | **enabled** |
-| LendingProtocol (XLS-66) `565B90CA…99509` | not enabled, no majority | not enabled, no majority | **enabled** |
+## Cap math (first pool)
+AssetsMaximum = DebtMaximum = 10,000 RLUSD. XLS-66 counts expected interest toward both limits: LoanSet fails if
+AssetsTotal ≥ AssetsMaximum, if AssetsTotal + InterestDue > AssetsMaximum or if DebtTotal + Principal + InterestDue > DebtMaximum.
+At 10% APR, 3 payments of 30 days and the 750 fee rate (the lower tier gives the larger InterestDue, so the bound holds for both),
+the maximum principal is **9,839.02 RLUSD** (InterestDue 160.96, total 9,999.98), rounded down to the cent with a 0.01 margin.
+The app's deposit target equals that principal. The vault is public, so the ledger accepts deposits up to 10,000; if direct
+deposits fill it, LoanSet fails and lenders wait for RedemptionDate.
 
-The known-amendments page lists both with "Default Vote (latest stable release): No". The live status widget on that page loads through JavaScript, so I used the ledger query instead. A devnet path is therefore allowed, but v1 does not wire one up. Gated transactions: VaultCreate/Set/Deposit/Withdraw/Delete/Clawback, LoanBrokerSet/Delete/CoverDeposit/CoverWithdraw/CoverClawback, LoanSet/Delete/Manage/Pay. Intended mapping: one Vault per shop (its shares are the receipt), one LoanBroker with first-loss cover, and one LoanSet per draw.
+## QAK (app rules, not ledger rules)
+- Listing: a shop locks 250,000 QAK (app lock).
+- Fee cut: ledger QAK balance ≥ 100,000 at broker creation → ManagementFeeRate 750, else 1000.
+- Queue: locked QAK orders the deposit queue (advisory; the vault is public).
+- Vote: one QAK, one vote, on the listing and the cap.
+- Any QAK escrow or lock is an app lock. It is not CoverAvailable and the ledger never takes it. There is no QAK burn or
+  seizure on default (earlier drafts described a 50% burn; that mechanic is gone).
 
-## RLUSD
-Mainnet issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De`. Testnet issuer `rQhWct2fv4Vc4KRjRgMrxa8xPN9Zx9iLKV`. Currency hex `524C555344000000000000000000000000000000`. Source: docs.ripple.com.
+Tokenomics: 1,000,000,000 QAK. Public pool 50%, team 10%, marketing 20%, AMM 20%. Launched on FirstLedger with 50 XRP liquidity,
+1% AMM fee and a 15-minute anti-sniper. Issuer `r98RkKUasH5vA3mshD5Bi3eAVHCYwziY9M` is blackholed (verified live). Issuer half escrowed:
+125M unlocks 8 Oct 2026 15:49 EEST, 375M unlocks 7 Nov 2026 16:24 EET.
 
-## Positioning notes
-- The product reference is Clearpool: named borrower pools, lender deposits, share receipts and a protocol token. Clearpool's governance page and press coverage describe an RLUSD institutional credit fund for XRPL, announced 20 Aug 2026 with Ripple (as LP) and Cicada Partners. It is "coming soon" and in devnet testing until XLS-65/66 activate. This is not a claim that it is live.
-- FirstLedger is a token launch venue. It cannot enforce a token tax and is not the credit venue.
+## Risks
+Clawback (the RLUSD issuer has it enabled) · no on-chain collateral · no liquidation · lock-up between the dates ·
+interest booked at LoanSet · Xaman support for XLS-65/66 transaction types is not verified, and Xaman does not document
+producing a LoanSet `CounterpartySignature` · not audited.
 
-## Sources
-- https://xrpl.org/docs.html · https://xrpl.org/resources/known-amendments
-- XLS-65: https://github.com/XRPLF/XRPL-Standards/tree/master/XLS-0065-single-asset-vault
-- XLS-66: https://github.com/XRPLF/XRPL-Standards/tree/master/XLS-0066-lending-protocol
-- Xaman: https://www.npmjs.com/package/xumm (Universal SDK) · https://github.com/XRPL-Labs/XummPkce · https://xumm.readme.io · https://apps.xaman.dev
-- RLUSD: https://docs.ripple.com/products/stablecoin/overview/token-addresses · https://docs.ripple.com/products/stablecoin/developer-resources/rlusd-on-the-xrpl
-- Clearpool: https://clearpool.finance/ · https://clearpool.finance/governance · https://cryptobriefing.com/clearpool-xrpl-institutional-credit-rlusd/
-
-## Xaman go-live (this build)
-1. On https://apps.xaman.dev, create or open the app. Add `https://updating-distinguished-greeting-consulting.trycloudflare.com/` to the allowed Origin/Redirect URIs (also add `http://localhost:5173/` for dev). The SDK uses the current page URL (`document.location.href`) as the OAuth2 `redirect_uri`. The app uses hash routes, so that URL is the site root plus `#/...`.
-2. Put the **API key only** in `/workspace/trustline/.env.local` as `VITE_XAMAN_API_KEY=<uuid>`. The API key is a public client id. The browser PKCE flow (`new Xumm(apiKey)`) never uses the API secret, so do not put the secret in any `VITE_` variable.
-3. Vite inlines `VITE_*` values at build time, so you must rebuild: `npm run build`. The python server serves `dist/` and picks up the new build right away.
-4. Once a valid key is present, the button reads "Connect Xaman" and only the real Xaman flow runs. The preview fallback refuses to run.
-5. Test it: connect, check the address and network shown, then click "Sign test (SignIn)" and approve in Xaman.
-
-## Whitepaper alignment (public/qak-whitepaper.pdf, Oct 2026)
-The rules live in `RULES` and `TOKENOMICS` in `src/config.js`, and each one is marked as a WP (whitepaper) value or an app rule.
-- Supply: 1,000,000,000 QAK, fixed. Listing lock: 250,000 QAK.
-- Fee: 1.00% of interest paid, or 0.75% for an account holding at least 100,000 QAK, taken in RLUSD. Half of fees go to the cover pot.
-- The cover pot pays the next default only up to its balance.
-- First-loss QAK is posted by any holder before the draw, cannot be pulled while the loan is open, and is released on repayment. It takes a shortfall before lenders, valued at the snapshot.
-- On default, the listing lock is treated as seized (app rule; the issuer is blackholed, so there is no clawback and nothing is burned).
-- Votes: one QAK is one vote, on listing and on cap only.
-- App rules where the WP is silent:
-  - first-loss of at least 15% of the draw at the draw snapshot
-  - a 1,000 QAK listing-vote threshold
-  - a 2,000 RLUSD initial cap with +50% growth per on-time loan
-  - a 30-day grace period before default
-
-## Deployment
-Pushes to `main` deploy to https://trustline-tan.vercel.app via Vercel Git integration. `VITE_XAMAN_API_KEY` is set in Vercel project settings, not in the repo.
+## Security
+Escaped HTML, CSP in `vercel.json`, input validation, wallet required to apply or vote, 404 for unknown routes and pools,
+load-time sanitising of stored state. `.env*` files are git-ignored; never commit `.env.local`.

@@ -3,7 +3,7 @@
     {
       "source": "/((?!qak-whitepaper\\.pdf$).*)",
       "headers": [
-        { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://xumm.app https://oauth2.xumm.app wss://xumm.app https://xrplcluster.com wss://s.altnet.rippletest.net:51233 wss://s.devnet.rippletest.net:51233; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" },
+        { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://xumm.app https://oauth2.xumm.app wss://xumm.app https://xrplcluster.com https://testnet.xrpl-labs.com https://devnet.xrpl-labs.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" },
         { "key": "X-Frame-Options", "value": "DENY" },
         { "key": "X-Content-Type-Options", "value": "nosniff" },
         { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
