@@ -109,11 +109,21 @@ figures (8,499.98 RLUSD owed after 1,500.00 of cover), 150% needed about 9,010 X
 <tr><td>4. LoanPay</td><td>the shop's signed <code>LoanPay</code></td><td>LoanPay is borrower-only, so the shop signs it in Xaman without submitting. The bot sends the shop exactly that amount from the proceeds and submits the shop's LoanPay. A vault deposit is not a route: VaultDeposit after SubscriptionDate fails <code>tecEXPIRED</code>, and the pseudo-account cannot receive payments.</td></tr></table>
 <p>Then <code>LoanManage</code> tfLoanDefault for the remainder, once the ledger allows it. Any shortfall is written down on that vault. The pool page derives all four
 steps from ledger reads (Loan flags, escrow entries, validated transactions); the browser holds no keys. The bot is a broker-side Node script.</p>
+<h3>Leftover proceeds go to the lenders, pro rata</h3>
+<div class="box warn">App rule the broker promises. The ledger does not enforce it, and it sits outside the vault and the loan.</div>
+<p>Sale proceeds that the bot could not put into the loan by LoanPay (less than one installment, or anything still with the broker once the
+loan is defaulted or closed) are paid by the broker wallet straight to that pool's lenders, as a <code>Payment</code> in the vault asset (RLUSD; DUSD on devnet).</p>
+<table><tr><th>Choice</th><th>Rule</th></tr>
+<tr><td>Basis</td><td>Each lender's vault MPT share balance at the snapshot: the ledger of the <code>LoanManage</code> default (up to that transaction), or of the LoanPay that closed the loan. Read-only: Clio <code>mpt_holders</code> for the vault's ShareMPTID at that ledger; where the server is not Clio, the balances are rebuilt from the MPToken entries in the vault's VaultDeposit/VaultWithdraw history, so lenders who have since withdrawn still count.</td></tr>
+<tr><td>Who counts</td><td>Every share holder. The vault pseudo-account issues the shares and holds none. Shares the broker holds count like any lender's; that part needs no payment.</td></tr>
+<tr><td>Rounding and dust</td><td>Amounts are floored to 0.000001. The remainder (fewer micro-units than there are holders) goes to the largest holder; ties go to the lowest address. Below 0.000001 in total, nothing is paid.</td></tr>
+<tr><td>No trust line</td><td>A Payment cannot deliver the asset to an account without a trust line for it. That lender's amount stays recorded as owed and is shown on the pool page.</td></tr>
+<tr><td>Proof of payment</td><td>Each Payment carries the memo <code>duckbank/leftover</code> with the LoanID, so the pool page lists every lender's amount with its payment hash, or the amount still owed.</td></tr></table>
 <h3>Where the ledger and the plan differ</h3>
 <table><tr><th>Point</th><th>Ledger fact</th><th>How Duck Bank handles it</th></tr>
 <tr><td>Finish timing</td><td>The broker can finish whenever it holds the fulfillment, after FinishAfter and before CancelAfter.</td><td>"A price drop never finishes the escrow" and "the sale comes only after LoanManage" are app rules (broker promises). FinishAfter = SubscriptionDate + PaymentInterval, the first moment any payment can be overdue, so the ledger does block an earlier finish.</td></tr>
 <tr><td>XRP back to a repaying shop</td><td>Only <code>EscrowCancel</code> after CancelAfter (before it: <code>tecNO_PERMISSION</code>, seen on devnet).</td><td>CancelAfter = RedemptionDate + 1 day. The app's LoanSet deadline is RedemptionDate − term − grace − sale window, so the last due date, the grace period and the bot's sale window all end before CancelAfter. A shop that repays waits for CancelAfter, unless the broker finishes and sends the XRP back earlier (app rule).</td></tr>
-<tr><td>Getting proceeds into the vault</td><td>LoanPay is borrower-only; it works on an impaired loan and fails <code>tecKILLED</code> after default. A late LoanPay settles one installment, with no partial payments.</td><td>Order: impair → finish → sell → the shop's LoanPay while impaired → default the remainder. Proceeds below one installment cannot be delivered and count as shortfall. Without the shop's signature, step 4 is stuck. Leftover proceeds go back to the shop once the loan is closed (app rule, open for review).</td></tr>
+<tr><td>Getting proceeds into the vault</td><td>LoanPay is borrower-only; it works on an impaired loan and fails <code>tecKILLED</code> after default. A late LoanPay settles one installment, with no partial payments.</td><td>Order: impair → finish → sell → the shop's LoanPay while impaired → default the remainder. Proceeds below one installment cannot go into the loan, so the vault books that part as shortfall at default. Without the shop's signature, step 4 is stuck. Those leftover proceeds then go to the pool's lenders, pro rata (below).</td></tr>
 <tr><td>Timing in config</td><td>Default needs now &gt; NextPaymentDueDate + GracePeriod.</td><td>Sale window 3 days (config) after the grace period; investment window = term + grace + sale window + 3 days of slack (first pool: 103 days).</td></tr></table>
 <h3>No XRP: the cover-only path</h3>
 <p>A shop with no XRP lists on the cover-only path with a cap of at most 1,000 RLUSD (config) and a file kept on the desk, off-ledger. It has no escrow;
@@ -155,10 +165,11 @@ labelled test IOU from a configured test issuer; with none configured, devnet ac
 <p><b>Devnet run of the escrow path (8 October 2026, 13:13–13:35 EEST, DUSD test token, cap 50).</b> The shop escrowed 15 + 9 XRP to the broker wallet.
 The app kept LoanSet blocked at a 127.6% ratio and opened it at 176%. After a price drop and a missed installment, the bot marked the loan, finished both escrows,
 sold 24 XRP for 31.53 DUSD and paid 24.99 DUSD as the shop's own signed LoanPay. LoanPay worked on the impaired loan; nothing was blocked. The remaining 6.55 DUSD
-was below one installment and stayed undelivered. After the next miss, the default moved 3.75 DUSD of cover, and 21.24 DUSD was written down on that vault.
+was below one installment. After the next miss, the default moved 3.75 DUSD of cover, and 21.24 DUSD was written down on that vault.
 The broker's LoanPay (<code>tecNO_PERMISSION</code>), the shop's early EscrowCancel (<code>tecNO_PERMISSION</code>), a VaultDeposit after SubscriptionDate
 (<code>tecEXPIRED</code>) and LoanPay after default (<code>tecKILLED</code>) were rejected as expected; after CancelAfter, a third party cancelled leftover
-escrows and the XRP went back to the shop. Every hash is on the app's Status page.</p>
+escrows and the XRP went back to the shop. The leftover 6.547539 DUSD was then paid by the bot's <code>distribute</code> command to the only share holder
+at the default (100% of the shares; the snapshot was rebuilt from the vault's history, as devnet has no Clio <code>mpt_holders</code>). Every hash is on the app's Status page.</p>
 <p>Xaman is the wallet. Its network list includes DEVNET, so sign requests can be forced to devnet. Xaman support for the XLS-65/66
 transaction types is not verified, and Xaman does not document producing a LoanSet <code>CounterpartySignature</code>, so the shop's
 counter-signature cannot yet be collected in the app. EscrowCreate is a standard mainnet transaction type, and Xaman's developer documentation
@@ -168,6 +179,7 @@ says it accepts all mainnet transaction types. Without an API key, the app runs 
 <ul><li><b>Clawback.</b> The RLUSD issuer has clawback enabled. It can claw back RLUSD from a vault and broker cover above the minimum.</li>
 <li><b>No on-chain collateral.</b> Loans are unsecured on the ledger. The shop's XRP escrow sits beside the loan; XLS-66 does not take it as collateral.</li>
 <li><b>No ledger liquidation.</b> On default only RLUSD cover, up to the rates, reaches the vault. The bot's XRP sale is an app step: it may fall short (thin book, price gap, the 3% limit), it needs the shop's signed LoanPay, and the broker can finish an escrow at any time it holds the fulfillment. The rest is written down on that vault.</li>
+<li><b>Leftover to lenders is a broker promise.</b> The ledger does not enforce it; a lender with no trust line for the asset cannot receive it, and that amount stays recorded as owed.</li>
 <li><b>Lock-up.</b> Withdrawals are blocked from SubscriptionDate to RedemptionDate.</li>
 <li><b>Interest booking.</b> The XLS-66 text books expected interest at LoanSet; devnet booked it as paid. The app counts expected interest toward the caps.</li>
 <li><b>XRP locked.</b> A repaying shop's XRP stays in escrow until CancelAfter. If LoanSet never happens, it also stays until CancelAfter.</li>

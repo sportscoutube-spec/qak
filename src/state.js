@@ -305,9 +305,60 @@ export function saleSteps({ loan = null, marked = null, escrows = [], sales = []
   else if (defaulted) s4 = S("stuck", "loan defaulted with no LoanPay from the proceeds", [defaulted.hash]);
   else if (nextDue != null && proceeds < nextDue) s4 = S("stuck", `proceeds ${+proceeds.toFixed(6)} are below one installment (${+nextDue.toFixed(6)}); LoanPay takes no partial payment`);
   else s4 = S(late ? "stuck" : "waiting", "waiting for the shop's signed LoanPay (XLS-66 accepts LoanPay only from Loan.Borrower)");
+  const leftover = Math.max(0, proceeds - paid);
   return { steps: [["Mark the loan (LoanManage)", s1], ["Finish every escrow (EscrowFinish + fulfillment)", s2], ["Sell the XRP (OfferCreate on the DEX/AMM)", s3], ["LoanPay up to what is owed", s4]].map(([name, st], i) => ({ n: i + 1, name, ...st })),
-    proceeds, paid, undelivered: Math.max(0, proceeds - paid), shortfall: defaulted ? defaulted.vaultLoss : null };
+    proceeds, paid, undelivered: leftover, leftover, leftoverFixed: leftoverFixed({ loan, defaulted }), shortfall: defaulted ? defaulted.vaultLoss : null };
 }
+// ---------- Leftover proceeds to the pool's lenders, pro rata (app rule; the ledger does not enforce it) ----------
+// Leftover = sale proceeds the bot could not put into the loan by LoanPay (below one installment, or still with the broker once the
+// loan is defaulted or closed). The broker pays it to that pool's lenders off-ledger, outside the vault and the loan, in proportion to
+// their vault MPT share balances at the snapshot (the ledger of the default, or of the LoanPay that closed the loan).
+export const LEFTOVER = { DECIMALS: 6, MEMO_TYPE: "duckbank/leftover" };
+const UNIT = 10n ** BigInt(LEFTOVER.DECIMALS);
+const toUnits = (x) => { const [i, f = ""] = Number(x).toFixed(12).split("."); return BigInt(i) * UNIT + BigInt((f + "000000000000").slice(0, LEFTOVER.DECIMALS)); }; // floor to 1e-6
+const fromUnits = (u) => Number(u) / Number(UNIT);
+// Holders from Clio mpt_holders (mptokens[]). The vault pseudo-account is the share issuer and never holds its own shares; it is dropped
+// if it ever appears. Zero balances are dropped. Broker-held shares count like any lender's (they bore the same loss).
+export function holdersFromMptHolders(mptokens, pseudo) {
+  return (mptokens || []).filter((m) => m.account !== pseudo && BigInt(m.mpt_amount || "0") > 0n).map((m) => ({ account: m.account, shares: BigInt(m.mpt_amount) }));
+}
+// Holders rebuilt from validated transaction metadata (VaultDeposit / VaultWithdraw / share transfers): the last MPToken state of each
+// account for this ShareMPTID at or before the snapshot point {ledger, txIndex}. Deleted MPToken = 0; MPTAmount omitted = 0.
+export function holdersFromHistory(txs, shareId, pseudo, at) {
+  const bal = new Map(), inScope = (x) => x.ledger < at.ledger || (x.ledger === at.ledger && (at.txIndex == null || x.txIndex <= at.txIndex));
+  const ordered = (txs || []).filter((x) => x.meta && x.meta.TransactionResult === "tesSUCCESS" && inScope(x)).sort((a, b) => a.ledger - b.ledger || a.txIndex - b.txIndex);
+  for (const x of ordered) for (const n of x.meta.AffectedNodes || []) {
+    const kind = Object.keys(n)[0], e = n[kind]; if (e.LedgerEntryType !== "MPToken") continue;
+    const f = e.FinalFields || e.NewFields || {}; if (f.MPTokenIssuanceID !== shareId || !f.Account) continue;
+    bal.set(f.Account, kind === "DeletedNode" ? 0n : BigInt(f.MPTAmount || "0"));
+  }
+  return [...bal].filter(([a, v]) => a !== pseudo && v > 0n).map(([account, shares]) => ({ account, shares }));
+}
+// Pro-rata split in 1e-6 units of the vault asset. Each amount = floor(total × shares / allShares). Rounding remainder (dust, always fewer
+// units than there are holders) goes to the largest holder (ties: lowest address), so the whole leftover is assigned.
+export function proRata(total, holders) {
+  const T = toUnits(total), list = (holders || []).filter((h) => h.shares > 0n).map((h) => ({ account: h.account, shares: BigInt(h.shares) }));
+  const all = list.reduce((t, h) => t + h.shares, 0n);
+  if (!list.length || all === 0n || T <= 0n) return { total: fromUnits(T > 0n ? T : 0n), payouts: [], dust: 0, dustTo: null, unassigned: fromUnits(T > 0n ? T : 0n) };
+  const rows = list.map((h) => ({ ...h, units: (T * h.shares) / all }));
+  const dust = T - rows.reduce((t, r) => t + r.units, 0n);
+  const big = [...rows].sort((a, b) => (b.shares > a.shares ? 1 : b.shares < a.shares ? -1 : a.account < b.account ? -1 : 1))[0];
+  big.units += dust;
+  return { total: fromUnits(T), payouts: rows.map((r) => ({ account: r.account, shares: r.shares.toString(), pct: Number((r.shares * 1000000n) / all) / 10000, amount: fromUnits(r.units) })), dust: fromUnits(dust), dustTo: big.account, unassigned: 0 };
+}
+// Per-lender status: paid (a broker Payment with the Duck Bank memo for this loan), owed (not yet paid), or owed with no trust line for the
+// vault asset (a Payment cannot reach it; the amount stays recorded as owed and is shown).
+// `self` = the broker wallet: its pro-rata part for shares it holds itself needs no Payment (status "kept: broker's own shares").
+export function leftoverStatus(split, { paid = [], lines = {}, self = null } = {}) {
+  const rows = split.payouts.map((p) => { const ps = paid.filter((x) => x.to === p.account), got = ps.reduce((t, x) => t + x.amount, 0);
+    if (p.account === self) return { ...p, paid: 0, hashes: [], owed: 0, status: "kept: broker's own shares (no payment needed)" };
+    const owed = Math.max(0, +(p.amount - got).toFixed(LEFTOVER.DECIMALS));
+    return { ...p, paid: +got.toFixed(LEFTOVER.DECIMALS), hashes: ps.map((x) => x.hash), owed, status: owed === 0 ? "paid" : lines[p.account] === false ? "owed: no trust line" : "owed" }; });
+  return { rows, paid: rows.reduce((t, r) => t + r.paid, 0), owed: rows.reduce((t, r) => t + r.owed, 0) };
+}
+// The leftover is fixed only once the loan is defaulted or settled (or deleted); before that it may still go into a LoanPay.
+export const leftoverFixed = ({ loan, defaulted }) => !!defaulted || !loan || loan.PaymentRemaining === 0;
+
 // LoanSet gate for the escrow path (app rule: the ledger's LoanSet knows nothing of the escrow). Cover-only path: small cap + desk file.
 export function loanSetEscrowGate(pool, ev = {}) {
   const r = [];

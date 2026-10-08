@@ -1,6 +1,7 @@
 // Read-only ledger reads: QAK issuer/balances (mainnet), amendment status via the `feature` RPC (per network),
 // and Vault/LoanBroker/Loan entries by id. No transactions are built or sent here.
 import { QAK_ISSUER, QAK_CURRENCY, LEDGER_RPC, NETWORKS, AMENDMENTS, RIPPLE_EPOCH, MARKETS, FLAGS as TXF } from "./config.js";
+import * as S from "./state.js";
 export { RIPPLE_EPOCH };
 export const BLACKHOLES = ["rrrrrrrrrrrrrrrrrrrrrhoLvTp","rrrrrrrrrrrrrrrrrrrrBZbvji","rrrrrrrrrrrrrrrrrrrn5RM1rHd","rrrrrrrrrrrrrrrrrNAMEtxvNvQ"];
 export const FLAGS = { lsfRequireDestTag:0x00020000, lsfRequireAuth:0x00040000, lsfDisallowXRP:0x00080000, lsfDisableMaster:0x00100000,
@@ -113,7 +114,42 @@ export function balanceDelta(meta, account, asset) {
   return d;
 }
 const vaultLossOf = (meta) => { for (const n of meta?.AffectedNodes || []) { const x = n.ModifiedNode; if (x && x.LedgerEntryType === "Vault" && x.PreviousFields?.AssetsTotal != null) return Number(x.PreviousFields.AssetsTotal) - Number(x.FinalFields.AssetsTotal); } return null; };
-async function accountTx(net, account, f) { const r = await rpc("account_tx", { account, ledger_index_min: -1, ledger_index_max: -1, limit: 400, forward: false }, f, rpcUrl(net)); return (r.transactions || []).map((x) => ({ tx: x.tx_json || x.tx, meta: x.meta, hash: x.hash || (x.tx_json || x.tx)?.hash })); }
+const txRow = (x) => { const tx = x.tx_json || x.tx || {}; return { tx, meta: x.meta, hash: x.hash || tx.hash, ledger: Number(x.ledger_index ?? tx.ledger_index), txIndex: Number(x.meta?.TransactionIndex ?? 0) }; };
+async function accountTx(net, account, f) { const r = await rpc("account_tx", { account, ledger_index_min: -1, ledger_index_max: -1, limit: 400, forward: false }, f, rpcUrl(net)); return (r.transactions || []).map(txRow); }
+// Full history of an account (paged with marker, oldest first), capped at `max` transactions.
+export async function accountTxAll(net, account, f = globalThis.fetch, max = 5000) {
+  const out = []; let marker;
+  do { const r = await rpc("account_tx", { account, ledger_index_min: -1, ledger_index_max: -1, limit: 400, forward: true, ...(marker ? { marker } : {}) }, f, rpcUrl(net));
+    out.push(...(r.transactions || []).map(txRow)); marker = r.marker; } while (marker && out.length < max);
+  return out;
+}
+// Memo the bot puts on each leftover Payment, so the app can find them: MemoType "duckbank/leftover", MemoData = the LoanID.
+const hex = (t) => Array.from(new TextEncoder().encode(t)).map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+export const leftoverMemo = (LoanID) => ({ Memo: { MemoType: hex("duckbank/leftover"), MemoData: hex(LoanID) } });
+const isLeftoverPay = (tx, LoanID) => (tx.Memos || []).some((m) => m.Memo?.MemoType === hex("duckbank/leftover") && m.Memo?.MemoData === hex(LoanID));
+// Vault share holders at a snapshot point, read-only. First Clio's mpt_holders at that ledger; where the server is not Clio (xrpld answers
+// unknownCmd), rebuild the balances from the vault pseudo-account's validated history (every share mint/burn/transfer touches the
+// MPTokenIssuance it issues, so those transactions are in its account_tx).
+export async function shareSnapshot(net, { VaultID, at }, f = globalThis.fetch) {
+  const v = await ledgerEntry(net, VaultID, f); const shareId = v.ShareMPTID, pseudo = v.Account;
+  try {
+    const list = []; let marker;
+    do { const r = await rpc("mpt_holders", { mpt_issuance_id: shareId, ledger_index: at.ledger, limit: 400, ...(marker ? { marker } : {}) }, f, rpcUrl(net)); list.push(...(r.mptokens || [])); marker = r.marker; } while (marker);
+    return { source: "mpt_holders (Clio)", shareId, pseudo, at, holders: S.holdersFromMptHolders(list, pseudo), note: at.txIndex != null ? "Clio reads whole ledgers; the default ledger's own share changes are included" : "" };
+  } catch (e) { if (!/unknownCmd|notSupported|Unknown method|unknown/i.test(e.message)) throw e; }
+  const txs = await accountTxAll(net, pseudo, f);
+  return { source: "rebuilt from the vault's VaultDeposit/VaultWithdraw history", shareId, pseudo, at, holders: S.holdersFromHistory(txs, shareId, pseudo, at) };
+}
+// Balance of `account` in an IOU (its line to the issuer), as a number; 0 with no line.
+export async function iouBalance(net, account, asset, f = globalThis.fetch) {
+  const r = await rpc("account_lines", { account, peer: asset.issuer, ledger_index: "validated" }, f, rpcUrl(net));
+  const l = (r.lines || []).find((x) => x.currency === asset.currency); return l ? Number(l.balance) : 0;
+}
+// Does `account` have a trust line to the vault asset's issuer for that currency? (No line: a Payment cannot deliver the asset.)
+export async function hasLine(net, account, asset, f = globalThis.fetch) {
+  try { const r = await rpc("account_lines", { account, peer: asset.issuer, ledger_index: "validated" }, f, rpcUrl(net)); return (r.lines || []).some((l) => l.currency === asset.currency); }
+  catch (e) { if (/actNotFound/.test(e.message)) return false; throw e; }
+}
 // Everything saleSteps() needs, read from the ledger: Loan, the broker's LoanManage/EscrowFinish/OfferCreate/Payment, the shop's LoanPay
 // and escrow cancels. `escrows` = [{owner, seq}] on record. Only validated tesSUCCESS transactions count.
 export async function saleInputs(net, { LoanID, broker, shop, escrows, quote }, f = globalThis.fetch) {
@@ -140,6 +176,11 @@ export async function saleInputs(net, { LoanID, broker, shop, escrows, quote }, 
     .filter((x) => x.xrpDrops > 0 && x.quote > 0);
   const pays = markDate == null ? [] : txs.filter((x) => x.tx.TransactionType === "LoanPay" && x.tx.LoanID === LoanID && x.tx.date >= markDate)
     .map((x) => ({ hash: x.hash, quote: -balanceDelta(x.meta, x.tx.Account, quote) }));
-  const defaulted = defTx ? { hash: defTx.hash, vaultLoss: vaultLossOf(defTx.meta) } : null;
-  return { loan, marked: markTx ? { hash: markTx.hash, date: markDate } : null, escrows: es, sales, pays, defaulted };
+  const defaulted = defTx ? { hash: defTx.hash, vaultLoss: vaultLossOf(defTx.meta), ledger: defTx.ledger, txIndex: defTx.txIndex } : null;
+  // Snapshot point for the leftover: the default, or else the last LoanPay once the loan is settled/gone.
+  const lastPay = txs.filter((x) => x.tx.TransactionType === "LoanPay" && x.tx.LoanID === LoanID).pop();
+  const fixedAt = defTx ? { ledger: defTx.ledger, txIndex: defTx.txIndex, by: "default", hash: defTx.hash } : (!loan || loan.PaymentRemaining === 0) && lastPay ? { ledger: lastPay.ledger, txIndex: lastPay.txIndex, by: "last LoanPay", hash: lastPay.hash } : null;
+  const leftoverPays = txs.filter((x) => x.tx.Account === broker && x.tx.TransactionType === "Payment" && isLeftoverPay(x.tx, LoanID))
+    .map((x) => ({ hash: x.hash, to: x.tx.Destination, amount: -balanceDelta(x.meta, broker, quote) }));
+  return { loan, marked: markTx ? { hash: markTx.hash, date: markDate } : null, escrows: es, sales, pays, defaulted, fixedAt, leftoverPays };
 }

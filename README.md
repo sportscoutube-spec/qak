@@ -110,7 +110,18 @@ Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file k
   `tecKILLED` after default. A late payment settles one installment, with no partial payments. So step 4 is a LoanPay the shop
   signs without submitting (Xaman `submit:false`); the bot funds the shop with exactly that amount and submits it. VaultDeposit
   after SubscriptionDate fails `tecEXPIRED`, and the vault pseudo-account cannot receive payments, so neither is a route.
-  Undelivered proceeds go back to the shop after the loan closes (app rule, open for review).
+- **Leftover proceeds go to the lenders, pro rata (app rule the broker promises; the ledger does not enforce it, and it is
+  outside the vault and the loan).** Proceeds the bot could not put into the loan by LoanPay (below one installment, or
+  still with the broker once the loan is defaulted or closed) are paid by the broker wallet as a `Payment` in the vault asset
+  to each lender, pro rata to their vault MPT shares at the snapshot (the ledger of the default, up to that transaction, or
+  of the LoanPay that closed the loan).
+  - Snapshot: Clio `mpt_holders` for the ShareMPTID at that ledger; on xrpld (no `mpt_holders`) the balances are rebuilt
+    from the MPToken entries in the vault pseudo-account's history, so lenders who withdrew later still count.
+  - Every share holder counts. The pseudo-account issues the shares and holds none; broker-held shares count, and that part
+    needs no payment.
+  - Amounts floored to 0.000001; the rounding remainder goes to the largest holder (ties: lowest address).
+  - No trust line for the asset: the Payment cannot deliver, so the amount stays recorded as owed and is shown.
+  - Each Payment carries the memo `duckbank/leftover` + LoanID; the pool page lists amounts, hashes and anything owed.
 - **Impair needs an overdue payment.** A price breach while payments are current arms the bot, which then waits for the next due date.
 
 ### The bot (`bot/escrow-bot.js`, broker side, devnet only)
@@ -120,6 +131,7 @@ node escrow-bot.js condition --out ~/duckbank/escrow-secret.json
 node escrow-bot.js status --pool ~/duckbank/pool.json
 BROKER_SEED=… ESCROW_FULFILLMENT=… node escrow-bot.js run --pool ~/duckbank/pool.json --dry-run
 node escrow-bot.js run --pool ~/duckbank/pool.json --secrets ~/duckbank/bot-secrets.json --loanpay-blob blob.txt --watch 10
+node escrow-bot.js distribute --pool ~/duckbank/pool.json --dry-run        # leftover to lenders, pro rata (run also calls it at the end)
 ```
 Seeds come only from env or a 0600 secrets file outside the repo, and are never logged. Mainnet and testnet are refused.
 

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --port 4173",
-    "test": "node src/state.test.js && node src/ledger.test.js && node src/escrow.test.js && npm run test:bot",
+    "test": "node src/state.test.js && node src/ledger.test.js && node src/escrow.test.js && node src/leftover.test.js && npm run test:bot",
     "test:bot": "if [ -d bot/node_modules/xrpl ]; then node bot/escrow-bot.test.js; else echo 'bot tests skipped: run npm install in bot/'; fi"
   },
   "keywords": [],

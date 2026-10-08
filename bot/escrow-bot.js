@@ -9,6 +9,10 @@
 //   node bot/escrow-bot.js run --pool <pool.json> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>] [--max-minutes <m>]
 //        1 LoanManage tfLoanImpair once a payment is overdue  2 EscrowFinish every escrow  3 OfferCreate (IOC + sell) XRP for the vault asset
 //        4 fund and submit the shop's own signed LoanPay (XLS-66: only Loan.Borrower may LoanPay)  then LoanManage tfLoanDefault for the rest
+//        then, once the loan is defaulted or closed, `distribute` (below)
+//   node bot/escrow-bot.js distribute --pool <pool.json> [--dry-run] [--secrets <file>]
+//        leftover proceeds (not put into the loan by LoanPay) to the pool's lenders, pro rata to their vault MPT shares at the default
+//        (or at the LoanPay that closed the loan): a Payment in the vault asset from the broker wallet to each lender. App rule.
 //
 // Secrets: BROKER_SEED and ESCROW_FULFILLMENT from the environment, or --secrets <json outside the repo, mode 0600> with
 // {"brokerSeed": "...", "fulfillment": "..."}. Secrets are never printed or written anywhere else. Mainnet and testnet are refused.
@@ -193,8 +197,49 @@ async function status() {
 async function run() {
   const ctx = loadPool(), secrets = loadSecrets(!DRY), c = await connect(ctx.p.network);
   const watch = Number(opt("watch", 0)) || 0, until = Date.now() + (Number(opt("max-minutes", 30)) || 30) * 60000;
-  try { for (;;) { const r = await once(c, ctx, secrets); say("->", r.why); if (r.done || !watch || DRY || Date.now() > until) break; await new Promise((res) => setTimeout(res, watch * 1000)); } }
+  try { let r; for (;;) { r = await once(c, ctx, secrets); say("->", r.why); if (r.done || !watch || DRY || Date.now() > until) break; await new Promise((res) => setTimeout(res, watch * 1000)); }
+    if (r?.done && /defaulted|settled|loan gone/.test(r.why)) { say("loan defaulted or closed: distributing any leftover to the lenders, pro rata"); await distributeOnce(ctx, secrets, c); } }
   finally { await c.disconnect(); }
+}
+// Leftover proceeds to the pool's lenders, pro rata to their vault MPT shares at the snapshot (the default, or the LoanPay that closed
+// the loan). App rule the broker promises: a direct Payment in the vault asset from the broker wallet, outside the vault and the loan.
+// Amounts are floored to 0.000001; the rounding remainder goes to the largest holder. A holder with no trust line for the asset cannot
+// receive: its amount stays recorded as owed. Each Payment carries the memo "duckbank/leftover" + LoanID so the app can show it.
+async function distributeOnce(ctx, secrets, c) {
+  const { p, state, save } = ctx;
+  const broker = await node(c, { index: p.LoanBrokerID }); const vault = await node(c, { index: p.VaultID });
+  if (!vault) throw new Error("Vault not found (needed for the share snapshot)");
+  const brokerAcct = broker ? broker.Owner : secrets.wallet?.address; if (!brokerAcct) die("broker account unknown: the LoanBroker is gone, pass the broker seed");
+  if (secrets.wallet && secrets.wallet.address !== brokerAcct) die("the broker seed does not match LoanBroker.Owner");
+  const quote = { currency: vault.Asset.currency, issuer: vault.Asset.issuer };
+  const x = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote });
+  const st = S.saleSteps({ ...x, now: 0 });
+  if (!st.leftoverFixed || !x.fixedAt) { say("leftover not fixed yet: the loan is neither defaulted nor closed; nothing to distribute"); return { done: false }; }
+  say(`leftover ${st.leftover.toFixed(6)} = proceeds ${st.proceeds.toFixed(6)} − LoanPay ${st.paid.toFixed(6)}; snapshot at ledger ${x.fixedAt.ledger} (${x.fixedAt.by} ${x.fixedAt.hash})`);
+  const snap = await L.shareSnapshot(p.network, { VaultID: p.VaultID, at: x.fixedAt });
+  const split = S.proRata(st.leftover, snap.holders);
+  say(`share holders (${snap.source}): ${snap.holders.map((h) => `${h.account} ${h.shares}`).join(", ") || "none"}; dust ${split.dust} to ${split.dustTo || "n/a"}`);
+  if (!split.payouts.length) { say(`no share holders at the snapshot: ${split.unassigned} stays recorded with the broker`); state.leftover = { split, snapshot: { source: snap.source, at: x.fixedAt }, rows: [] }; save(); return { done: true }; }
+  const lines = {}; for (const r of split.payouts) lines[r.account] = await L.hasLine(p.network, r.account, quote);
+  let status = S.leftoverStatus(split, { paid: x.leftoverPays, lines, self: brokerAcct });
+  const due = status.rows.filter((r) => r.owed > 0 && r.status === "owed"), need = due.reduce((t, r) => t + r.owed, 0);
+  const have = await L.iouBalance(p.network, brokerAcct, quote).catch(() => null);
+  if (have != null && Number(have) + 1e-9 < need) { say(`broker holds ${have} of the vault asset, below the ${need.toFixed(6)} to pay; stopping`); return { done: false }; }
+  for (const r of due) {
+    const tx = { TransactionType: "Payment", Destination: r.account, Amount: { ...quote, value: String(+r.owed.toFixed(6)) }, Memos: [L.leftoverMemo(p.LoanID)] };
+    if (DRY) { say(`[dry-run] would pay ${r.owed} to ${r.account} (${r.pct}% of the shares):`, JSON.stringify(tx)); continue; }
+    const res = await submit(c, secrets.wallet, tx, state, `leftover ${r.owed} to ${r.account} (${r.pct}% of the shares)`, save);
+    if (res.code !== "tesSUCCESS") say(`payment to ${r.account} failed ${res.code}: the amount stays recorded as owed`);
+  }
+  for (const r of status.rows.filter((r) => r.status === "owed: no trust line")) say(`owed ${r.owed} to ${r.account}: no trust line for the vault asset, so it stays recorded as owed`);
+  if (!DRY) { const y = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote }); status = S.leftoverStatus(split, { paid: y.leftoverPays, lines, self: brokerAcct }); }
+  state.leftover = { split: { ...split, payouts: split.payouts }, snapshot: { source: snap.source, at: x.fixedAt }, rows: status.rows }; save();
+  for (const r of status.rows) say(`lender ${r.account}: ${r.amount} → ${r.status}${r.hashes.length ? " " + r.hashes.join(" ") : ""}`);
+  return { done: true };
+}
+async function distribute() {
+  const ctx = loadPool(), secrets = loadSecrets(!DRY), c = await connect(ctx.p.network);
+  try { await distributeOnce(ctx, secrets, c); } finally { await c.disconnect(); }
 }
 function condition() {
   const out = opt("out"); if (!out || out === true) die("--out <file outside the repo> required"); if (insideRepo(out)) die("refusing to write the fulfillment inside the repo");
@@ -204,6 +249,6 @@ function condition() {
   console.log(condition);
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const f = { condition, status, run }[cmd]; if (!f) die("usage: condition --out <file> | status --pool <file> | run --pool <file> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>]");
+  const f = { condition, status, run, distribute }[cmd]; if (!f) die("usage: condition --out <file> | status --pool <file> | run --pool <file> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>] | distribute --pool <file> [--dry-run] [--secrets <file>]");
   Promise.resolve(f()).catch((e) => die(e?.data?.error || e.message));
 }

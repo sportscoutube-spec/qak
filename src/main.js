@@ -52,9 +52,29 @@ function marketOf(net) { const c = LG.market[net]; if (!MARKETS[net]) return { n
 function loadEscrows(p) { const c = (LG.esc[p.id] ||= { loading: false, at: 0 }); if (!p.escrow.records.length || c.loading || Date.now() - c.at < 30000) return; c.loading = true; c.err = null;
   Promise.all(p.escrow.records.map((r) => L.escrowEntry(p.network, r.owner, r.seq).then((node) => ({ ...r, node })))).then((list) => { c.list = list; })
     .catch((e) => { c.err = e.message || "unavailable"; }).finally(() => { c.loading = false; c.at = Date.now(); soft(["pool"]); }); }
+// Leftover to lenders (app rule): snapshot the vault share holders read-only at the default (or the closing LoanPay), split pro rata,
+// match the broker's memo-tagged Payments, and check each holder's trust line.
+async function leftoverRead(net, VaultID, x, quote, broker) {
+  const st = S.saleSteps({ ...x, now: 0 }); if (!st.leftoverFixed || !x.fixedAt || !(st.leftover > 0)) return { st, pending: !st.leftoverFixed };
+  const snap = await L.shareSnapshot(net, { VaultID, at: x.fixedAt }), split = S.proRata(st.leftover, snap.holders), lines = {};
+  for (const r of split.payouts) lines[r.account] = await L.hasLine(net, r.account, quote).catch(() => null);
+  return { st, snap, split, status: S.leftoverStatus(split, { paid: x.leftoverPays || [], lines, self: broker }) };
+}
+const LEFT_RULE = "App rule the broker promises, separate from the vault and the loan, and not enforced by the ledger: sale proceeds that could not go into the loan by LoanPay (less than one installment, or anything still with the broker once the loan is defaulted or closed) are paid by the broker in the vault asset straight to that pool's lenders, pro rata to their vault MPT shares at the default (or at the LoanPay that closed the loan). Amounts are floored to 0.000001; the rounding remainder goes to the largest holder. A lender with no trust line for the asset cannot receive; that amount stays recorded as owed.";
+function leftoverHtml(lo, net) {
+  if (!lo) return "";
+  const tx = (h) => `<a href="https://${net === "devnet" ? "devnet" : "livenet"}.xrpl.org/transactions/${esc(h)}" target="_blank" rel="noopener noreferrer"><code>${esc(h.slice(0, 10))}…</code></a>`;
+  if (lo.err) return `<p class="warn">Leftover to lenders: read failed (${esc(lo.err)})</p>`;
+  if (lo.pending) return `<p class="note"><b>Leftover to lenders:</b> not fixed yet (the loan is neither defaulted nor closed).</p>`;
+  if (!lo.split) return `<p class="note"><b>Leftover to lenders:</b> none.</p>`;
+  const rows = lo.status.rows.map((r) => `<tr><td><code>${esc(r.account)}</code></td><td>${esc(r.pct)}%</td><td>${esc(r.amount.toFixed(6))}</td><td class="${r.status === "paid" ? "on" : r.status.startsWith("kept") ? "muted" : "warn"}">${esc(r.status)}${r.owed > 0 ? ` (${esc(r.owed.toFixed(6))} owed)` : ""}</td><td>${r.hashes.map(tx).join(" ")}</td></tr>`).join("");
+  return `<h4>Leftover to lenders (after step 4)</h4><p class="note">${esc(lo.split.total.toFixed(6))} split over the vault MPT share holders at ledger ${esc(lo.snap.at.ledger)} (${esc(lo.snap.at.by)}), read from ${esc(lo.snap.source)}. Dust ${esc(lo.split.dust.toFixed(6))} to ${esc(lo.split.dustTo || "n/a")}.</p>
+   <table><tr><th>Lender</th><th>Shares</th><th>Amount</th><th>Status</th><th>Payment</th></tr>${rows || '<tr><td colspan="5">no share holders at the snapshot: the amount stays recorded with the broker</td></tr>'}</table><p class="note">${esc(LEFT_RULE)}</p>`;
+}
 function loadSale(p) { const b = LG.pool[p.id]?.broker; if (!p.ledger.LoanID || !b || !p.account) return; const c = (LG.sale[p.id] ||= { loading: false, at: 0 }); if (c.loading || Date.now() - c.at < 30000) return;
   c.loading = true; c.err = null; L.saleInputs(p.network, { LoanID: p.ledger.LoanID, broker: b.Owner, shop: p.account, escrows: p.escrow.records, quote: NETWORKS[p.network].asset })
-    .then((x) => { c.x = x; }).catch((e) => { c.err = e.message || "unavailable"; }).finally(() => { c.loading = false; c.at = Date.now(); soft(["pool"]); }); }
+    .then(async (x) => { c.x = x; try { c.left = await leftoverRead(p.network, p.ledger.VaultID, x, NETWORKS[p.network].asset, b.Owner); } catch (e) { c.left = { err: e.message || "unavailable" }; } })
+    .catch((e) => { c.err = e.message || "unavailable"; }).finally(() => { c.loading = false; c.at = Date.now(); soft(["pool"]); }); }
 const memo = new Map();
 const xrpNeeded = (net, mk, owedNet) => { const k = `${net}|${mk.d?.fetchedAt?.getTime?.()}|${owedNet.toFixed(6)}`; if (!memo.has(k)) memo.set(k, S.xrpForRatio(mk, owedNet, ESCROW.ADD_LINE_PCT)); return memo.get(k); };
 // Everything the escrow card shows, derived from ledger reads plus the off-ledger records.
@@ -82,6 +102,7 @@ const qakRow = `<tr><td>QAK token</td><td>currency code ${esc(QAK_CURRENCY)}, is
 const lineNote = `<p class="note">To hold QAK, an account sets a trust line to issuer ${qakLink} for currency code ${esc(QAK_CURRENCY)}. This app never sends a TrustSet.</p>`;
 const risks = `<ul class="risks">
  <li><b>The XRP escrow sits beside the loan.</b> XLS-66 does not take it as collateral and does not sell it. The broker's bot finishes and sells it as an app step. With a Condition, the broker can finish an escrow whenever it holds the fulfillment (after any FinishAfter, before CancelAfter), so "a price drop never finishes the escrow" and "the sale comes only after LoanManage" are broker promises (app rules); the ledger does not enforce them.</li>
+ <li><b>Leftover to lenders is a broker promise.</b> Sale proceeds that cannot go into the loan are paid by the broker to that pool's lenders, pro rata to their vault MPT shares at the default. The ledger does not enforce this, it is separate from the vault and the loan, and a lender with no trust line for the asset cannot receive it (it stays recorded as owed).</li>
  <li><b>The sale may fall short.</b> A thin book or a price gap leaves a shortfall, written down on that vault. LoanPay takes no partial installment, and only the borrower (the shop) can send it.</li>
  <li><b>Clawback.</b> The RLUSD issuer has clawback enabled. It can claw back RLUSD from a vault (VaultClawback works in every phase) and broker cover above the minimum (LoanBrokerCoverClawback).</li>
  <li><b>No on-chain collateral.</b> Loans are unsecured on the ledger. The XLS-66 security section says the protocol "does not offer on-chain algorithmic protection against default".</li>
@@ -89,7 +110,7 @@ const risks = `<ul class="risks">
  <li><b>Lock-up.</b> Withdrawals are blocked from SubscriptionDate to RedemptionDate. Redemption opens on RedemptionDate even if a loan is late.</li>
  <li><b>Interest booking.</b> The XLS-66 text books the expected interest into AssetsTotal (and DebtTotal) at LoanSet. On devnet with LendingProtocolV1_1 the ledger books interest only as payments arrive (cash basis; seen in the devnet test run). The app still counts expected interest toward the caps and the cover, which is the stricter bound.</li>
  <li>The code is not audited.</li></ul>`;
-const step4Note = `Step 4 has to be a LoanPay signed by the shop: XLS-66 accepts LoanPay only from Loan.Borrower (the broker's own LoanPay fails tecNO_PERMISSION, seen on devnet). The bot never pays from the broker account. The shop signs its LoanPay in Xaman without submitting it and hands the signed blob to the desk; the bot sends exactly that amount to the shop and submits the shop's LoanPay straight away (app rule; without the shop's signature, step 4 stays stuck). LoanPay works on an impaired loan (it unimpairs it first) and fails tecKILLED after default. A late LoanPay settles one installment and ignores any excess. VaultDeposit is not a route: after SubscriptionDate it fails tecEXPIRED, and a deposit would only mint shares to the depositor.`;
+const step4Note = `Step 4 has to be a LoanPay signed by the shop: XLS-66 accepts LoanPay only from Loan.Borrower (the broker's own LoanPay fails tecNO_PERMISSION, seen on devnet). The bot never pays from the broker account. The shop signs its LoanPay in Xaman without submitting it and hands the signed blob to the desk; the bot sends exactly that amount to the shop and submits the shop's LoanPay straight away (app rule; without the shop's signature, step 4 stays stuck). LoanPay works on an impaired loan (it unimpairs it first) and fails tecKILLED after default. A late LoanPay settles one installment and ignores any excess. Proceeds left over after step 4 go to the pool's lenders pro rata (app rule, below). VaultDeposit is not a route: after SubscriptionDate it fails tecEXPIRED, and a deposit would only mint shares to the depositor.`;
 const pseudoNote = `The vault's pseudo-account holds the RLUSD. It cannot receive ordinary payments, so money reaches lenders only through VaultDeposit, LoanPay and, on default, cover moved by LoanManage.`;
 
 // ---------- gates ----------
@@ -223,7 +244,7 @@ function saleStepsHtml(st) {
   const tx = (net, h) => `<a href="https://${net === "devnet" ? "devnet" : "livenet"}.xrpl.org/transactions/${esc(h)}" target="_blank" rel="noopener noreferrer"><code>${esc(h.slice(0, 10))}…</code></a>`;
   const cls = { done: "on", stuck: "off", waiting: "warn", "not started": "muted" };
   return (net) => `<ol class="steps">${st.steps.map((x) => `<li><b>${esc(x.name)}</b>: <span class="${cls[x.status]}">${esc(x.status)}</span>. ${esc(x.detail)} ${x.txs.map((h) => tx(net, h)).join(" ")}</li>`).join("")}</ol>
-   <p class="note">Proceeds ${m2(st.proceeds)} · paid by LoanPay ${m2(st.paid)} · not delivered ${m2(st.undelivered)}${st.shortfall != null ? ` · written down on the vault at default ${m2(st.shortfall)}` : ""}</p>`;
+   <p class="note">Proceeds ${m2(st.proceeds)} · paid by LoanPay ${m2(st.paid)} · leftover for the lenders ${m2(st.leftover)}${st.shortfall != null ? ` · written down on the vault at default ${m2(st.shortfall)}` : ""}</p>`;
 }
 function saleCard(p) {
   if (p.path === PATHS.cover) return "";
@@ -231,7 +252,7 @@ function saleCard(p) {
   const st = S.saleSteps({ ...(sc?.x || {}), now, overdue: !!(loan && loan.PaymentRemaining > 0 && now > loan.NextPaymentDueDate) });
   return `<div class="card"><h3>The four sale steps (app steps, after LoanManage)</h3>
   <p class="note">Shown from ledger state only: Loan flags, Escrow entries, and the broker's and shop's validated transactions (account_tx). The browser holds no keys. The bot that sends these transactions is a broker-side Node script (<code>bot/escrow-bot.js</code>).</p>
-  ${saleStepsHtml(st)(p.network)}${sc?.err ? `<p class="warn">ledger read failed: ${esc(sc.err)}</p>` : ""}
+  ${saleStepsHtml(st)(p.network)}${sc?.left ? leftoverHtml(sc.left, p.network) : `<p class="note"><b>Leftover to lenders:</b> ${esc(LEFT_RULE)}</p>`}${sc?.err ? `<p class="warn">ledger read failed: ${esc(sc.err)}</p>` : ""}
   <p class="note">${esc(step4Note)}</p></div>`;
 }
 // Completed devnet runs (static record from the test scripts). Runs A and B deleted their objects; run C (escrow path) left them, so its sale steps can be re-derived live.
@@ -245,7 +266,8 @@ function devnetRunCard() { const R = DEVNET_TEST_RUN; if (!R) return "";
    ${live ? `<p><button id="rederive" class="sec">Re-derive the four sale steps of ${esc(live.title.split(":")[0])} from devnet now</button></p><div id="rederived">${LG.live ? LG.live : ""}</div>` : ""}</div>`; }
 async function rederive() { const r = DEVNET_TEST_RUN.runs.find((x) => x.sale); if (!r) return; LG.live = '<p class="muted">reading devnet…</p>'; soft(["status"]);
   try { const x = await L.saleInputs("devnet", { LoanID: r.LoanID, broker: r.sale.broker, shop: r.sale.shop, escrows: r.sale.escrows, quote: r.sale.quote });
-    LG.live = saleStepsHtml(S.saleSteps({ ...x, now: S.nowRipple(), overdue: false }))("devnet") + `<p class="note">Read from devnet at ${esc(athens(new Date()))}: Loan entry ${x.loan ? "present" : "gone"}, ${x.escrows.length} escrow(s), ${x.sales.length} sale(s), ${x.pays.length} LoanPay(s).</p>`; }
+    let lo; try { lo = await leftoverRead("devnet", r.VaultID, x, r.sale.quote, r.sale.broker); } catch (e) { lo = { err: e.message || "unavailable" }; }
+    LG.live = saleStepsHtml(S.saleSteps({ ...x, now: S.nowRipple(), overdue: false }))("devnet") + leftoverHtml(lo, "devnet") + `<p class="note">Read from devnet at ${esc(athens(new Date()))}: Loan entry ${x.loan ? "present" : "gone"}, ${x.escrows.length} escrow(s), ${x.sales.length} sale(s), ${x.pays.length} LoanPay(s), ${(x.leftoverPays || []).length} leftover payment(s).</p>`; }
   catch (e) { LG.live = `<p class="warn">devnet read failed: ${esc(e.message || e)}</p>`; } soft(["status"]); }
 const pages = {
   "": () => { const pl = firstPlan(); return `<section class="hero"><div class="hero-text">
@@ -256,7 +278,7 @@ const pages = {
    </div><div class="hero-art"><img src="/banner.jpg" alt="Duck Bank on the XRP Ledger" class="banner"/></div></section>
    <div class="stats"><div><b>1</b><span>first pool (sample shop)</span></div><div><b>${n(RULES.MAX_CAP_RLUSD)}</b><span>${ASSET} cap (AssetsMaximum)</span></div><div><b>${m2(pl.maxPrincipal)}</b><span>${ASSET} max principal under the cap</span></div><div><b>Off</b><span>mainnet deposits</span></div></div>
    <div class="grid"><div class="card"><h3>The ledger model</h3>VaultCreate (VaultKind ClosedEnded, SubscriptionDate, RedemptionDate, AssetsMaximum) → LoanBrokerSet on that VaultID → LoanBrokerCoverDeposit in ${ASSET} → VaultDeposit in the subscription window → a LoanSet signed by broker and shop in the investment window → LoanPay. Overdue: LoanManage tfLoanImpair; after grace: LoanManage tfLoanDefault. Settled or written off: LoanDelete.</div>
-   <div class="card"><h3>The XRP escrow path</h3>Before LoanSet the shop sends EscrowCreate to the broker wallet with a PREIMAGE-SHA-256 Condition; the broker holds the fulfillment. LoanSet stays blocked until the app finds that escrow on the ledger. The pool page shows the live ratio (the escrowed XRP's sell-side value ÷ what is owed after RLUSD cover) against the ${ESCROW.ADD_LINE_PCT}% add line and the ${ESCROW.DEFAULT_LINE_PCT}% default line. XLS-66 does not take the escrow as collateral and does not sell it: the bot's sale is an app step, and it may fall short.</div>
+   <div class="card"><h3>The XRP escrow path</h3>Before LoanSet the shop sends EscrowCreate to the broker wallet with a PREIMAGE-SHA-256 Condition; the broker holds the fulfillment. LoanSet stays blocked until the app finds that escrow on the ledger. The pool page shows the live ratio (the escrowed XRP's sell-side value ÷ what is owed after RLUSD cover) against the ${ESCROW.ADD_LINE_PCT}% add line and the ${ESCROW.DEFAULT_LINE_PCT}% default line. XLS-66 does not take the escrow as collateral and does not sell it: the bot's sale is an app step, and it may fall short. Proceeds that cannot go into the loan are paid to that pool's lenders, pro rata (app rule).</div>
    <div class="card"><h3>QAK, the app token</h3>QAK lists a shop, sets the fee cut at broker creation, orders the deposit queue and votes on the listing and the cap. These are app rules. ${ASSET} is the lent asset, and the vault MPT share is the lender's receipt.</div>
    <div class="card"><h3>What the ledger takes on default</h3>Only the broker's ${ASSET} cover: LoanManage tfLoanDefault moves min(DebtTotal × CoverRateMinimum × CoverRateLiquidation, DefaultAmount, CoverAvailable) to the vault. There is no on-chain collateral and no ledger liquidation. The ${ASSET} issuer can claw back.</div>
    <div class="card"><h3>Status</h3>XLS-65/66 are not enabled on mainnet, so mainnet deposits are off. As of 8 Oct 2026, devnet has all three required amendments enabled; the devnet path needs a test issuer, because RLUSD does not exist on devnet. <a href="#/status">Live check</a></div></div>
@@ -335,14 +357,15 @@ const pages = {
    <div class="card"><h3>Deposit queue (app rule)</h3>Locked QAK orders the Duck Bank queue. The vault is public, so the ledger accepts any VaultDeposit during Subscription; the queue orders who the app invites first.
    <ol>${st.queue.map((q) => `<li>${esc(q.who.slice(0, 10))} ${n(q.amt)} → ${esc(q.id)} (QAK ${n(q.qakLocked)})</li>`).join("") || "<li>empty</li>"}</ol></div>
    <div class="card"><h3>QAK</h3><table>${qakRow}</table>${lineNote}</div>
-   <div class="card"><h3>If a shop misses</h3>The broker marks the loan (LoanManage tfLoanImpair), finishes the shop's XRP escrows, sells the XRP and gets the proceeds into the loan by a LoanPay the shop has signed. What the sale does not cover, and the ${ASSET} cover does not cover at default, is written down on that vault. The pool page shows each of the four steps as done or stuck.</div>
+   <div class="card"><h3>If a shop misses</h3>The broker marks the loan (LoanManage tfLoanImpair), finishes the shop's XRP escrows, sells the XRP and gets the proceeds into the loan by a LoanPay the shop has signed. What the sale does not cover, and the ${ASSET} cover does not cover at default, is written down on that vault. The pool page shows each of the four steps as done or stuck.
+   <br><b>Leftover proceeds</b> (less than one installment, or still with the broker once the loan is defaulted or closed) are paid by the broker straight to that pool's lenders, pro rata to their vault MPT shares at the default: a Payment in ${ASSET} outside the vault and the loan. This is an app rule the broker promises; the ledger does not enforce it. A lender needs a trust line for ${ASSET} to receive it; otherwise the amount stays recorded as owed.</div>
    <div class="card"><h3>Risks</h3>${risks}</div>`; },
   qak: () => { const R = RULES, K = TOKENOMICS; return `<h1>QAK</h1><p>QAK is Duck Bank's app token. Its roles are app rules; none of them is ledger cover.</p><div class="grid">
    ${[["Listing", `A shop locks <b>${n(R.LISTING_LOCK_QAK)} QAK</b> to be listed. This is an app lock.`],
      ["Fee cut", `ManagementFeeRate is fixed at LoanBrokerSet, so the discount is decided at broker creation: ${R.FEE_RATE} (${S.feePct(R.FEE_RATE)}% of interest), or ${R.FEE_RATE_DISCOUNT} (${S.feePct(R.FEE_RATE_DISCOUNT)}%) if the shop's ledger balance is at least ${n(R.DISCOUNT_MIN_HOLDING_QAK)} QAK at that moment.`],
      ["Queue", "Locked QAK orders the Duck Bank deposit queue. It does not reserve a fill, and the public vault accepts any VaultDeposit during Subscription."],
      ["Vote", "One QAK, one vote, on the listing and the cap. A vote cannot move another vault's deposits."],
-     ["Separate from the XRP escrow", "QAK is never escrowed for a loan and never sold by the bot. The shop's XRP escrow holds XRP only."]]
+     ["Separate from the XRP escrow", "QAK is never escrowed for a loan and never sold by the bot. The shop's XRP escrow holds XRP only, and leftover sale proceeds go to the vault's lenders pro rata by their vault MPT shares, not by QAK."]]
      .map(([h, b]) => `<div class="card"><h3>${h}</h3>${b}</div>`).join("")}</div>
    <div class="card"><h3>App locks are not cover</h3>Any QAK escrow or lock is an app lock. It is not CoverAvailable: LoanBrokerCoverDeposit accepts only the vault asset (${ASSET}) and only from the broker owner. On default the ledger takes RLUSD cover only. ${ASSET} is the lent asset, and the vault MPT share is the lender's receipt.</div>
    ${issuerCard()}${lineNote}
