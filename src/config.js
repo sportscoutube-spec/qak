@@ -1,6 +1,12 @@
 // Duck Bank configuration. Ledger names below are copied from XLS-65 (Single Asset Vault, incl. 65.1.4 Closed-Ended Vault)
 // and XLS-66 (Lending Protocol, incl. 66.1.2 Closed-Ended Loan Gates and 66.2). Product values are marked "app rule".
-const env = (typeof import.meta !== "undefined" && import.meta.env) || {};
+// Static per-key reads: Vite inlines only these three values (reading import.meta.env as an object would inline every VITE_* var).
+// The try/catch keeps Node tests working, where import.meta.env is undefined.
+const env = {
+  VITE_XAMAN_API_KEY: (() => { try { return import.meta.env.VITE_XAMAN_API_KEY; } catch { return undefined; } })(),
+  VITE_XAMAN_REDIRECT_URI: (() => { try { return import.meta.env.VITE_XAMAN_REDIRECT_URI; } catch { return undefined; } })(),
+  VITE_DEVNET_TEST_ISSUER: (() => { try { return import.meta.env.VITE_DEVNET_TEST_ISSUER; } catch { return undefined; } })(),
+};
 export const PRODUCT = { name: "Duck Bank", token: "QAK", site: "https://trustline-tan.vercel.app" };
 export const CONFIG = {
   xamanApiKey: env.VITE_XAMAN_API_KEY || "",
