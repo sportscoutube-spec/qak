@@ -1,6 +1,7 @@
 // Review fixes 2026-10-12: S1 key split helpers, S2 funding guards, account_tx paging, dry-run redaction, site footer.
 import assert from "node:assert"; import fs from "node:fs";
-import { redact, GRANT, checkGrant, asBroker, slotStatus, fundingState } from "../bot/escrow-bot.js";
+import { redact, GRANT, checkGrant, asBroker, slotStatus, fundingState, finishable, noPayoutReason } from "../bot/escrow-bot.js";
+import * as S from "../src/state.js";
 import { accountTxSince, fundMemo, fundOf } from "../src/ledger.js";
 import { t, done } from "./harness.js";
 const ID = "C".repeat(64);
@@ -39,5 +40,18 @@ await t("accountTxSince pages with markers and stops at the LoanSet that created
 });
 await t("site footer 'code is not audited' is in index.html (every route renders inside it)", () => {
   assert.match(fs.readFileSync(new URL("../index.html", import.meta.url), "utf8"), /<footer id="site-footer">[^<]*The code is not audited/);
+});
+await t("finishable: expired or near-expiry escrows are left out of the Batch (run-e cause); not-yet-finishable ones wait", () => {
+  const n = { FinishAfter: 845108610, CancelAfter: 845109360 };
+  assert.equal(finishable(n, 845109672).ok, false); assert.equal(finishable(n, 845109672).later, false); assert.match(finishable(n, 845109672).why, /CancelAfter/);
+  assert.equal(finishable(n, 845109340).ok, false, "inside the 30 s margin"); assert.equal(finishable(n, 845108000).later, true);
+  assert(finishable(n, 845109000).ok); assert(finishable({ CancelAfter: 100 }, 50).ok);
+  const src = fs.readFileSync(new URL("../bot/escrow-bot.js", import.meta.url), "utf8"); assert(/finishable\(e\.node, r\.now\)/.test(src), "once() filters rows through finishable");
+});
+await t("leftover 0 with share holders is reported as nothing to distribute, not as 'no share holders' (run-e bug)", () => {
+  const holders = [{ account: "rA", shares: 30000000n }, { account: "rB", shares: 19980000n }];
+  const split = S.proRata(0, holders); assert.equal(split.payouts.length, 0);
+  assert.match(noPayoutReason(split, holders), /nothing to distribute to the 2 share holders/); assert.doesNotMatch(noPayoutReason(split, holders), /no share holders/);
+  assert.match(noPayoutReason(S.proRata(5, []), []), /no share holders/);
 });
 done("test/review.fixes.test.js");

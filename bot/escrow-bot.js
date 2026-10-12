@@ -107,6 +107,20 @@ export function fundingState({ fundPays = [], loanPays = [], blobHash }) {
   return { paid: loanPays.includes(blobHash), funded: fundPays.some((f) => f.blobHash === blobHash), forfeited, owedByShop: forfeited.reduce((t, f) => t + f.amount, 0) };
 }
 
+// An EscrowFinish is valid only after FinishAfter and before CancelAfter (ledger close time). One expired escrow in an ALLORNOTHING
+// Batch rolls back the whole Batch (devnet run-e, 2026-10-12: every inner tx "not on the validated ledger"), so the bot leaves out
+// escrows that are not finishable now, with a safety margin of a few ledgers for the Batch to validate.
+export const FINISH_MARGIN_SECONDS = 30;
+export function finishable(node, now, margin = FINISH_MARGIN_SECONDS) {
+  if (node.FinishAfter != null && now < node.FinishAfter) return { ok: false, later: true, why: `FinishAfter ${node.FinishAfter} not reached (ledger time ${now}); waits` };
+  if (node.CancelAfter != null && now + margin >= node.CancelAfter) return { ok: false, later: false, why: `CancelAfter ${node.CancelAfter} passed or within ${margin}s (ledger time ${now}): the escrow can no longer be finished; it can only be cancelled back to the shop` };
+  return { ok: true };
+}
+// Why a leftover split has no payouts: nothing to pay (leftover 0) is not the same as nobody to pay it to.
+export function noPayoutReason(split, holders) {
+  if (!(holders || []).some((h) => BigInt(h.shares) > 0n)) return `no share holders at the snapshot: ${split.unassigned} stays recorded with the broker`;
+  return `leftover is ${split.total}: nothing to distribute to the ${holders.length} share holder${holders.length === 1 ? "" : "s"}`;
+}
 function loadPool() {
   const f = opt("pool"); if (!f || f === true) die("--pool <pool.json> required");
   const p = JSON.parse(fs.readFileSync(f, "utf8")); if (!NETS[p.network]) die(`network ${p.network} refused: this build runs the bot on devnet only (mainnet is hard-off)`);
@@ -225,7 +239,8 @@ async function once(c, ctx, secrets) {
   const ful = DRY ? "A0228020" + "0".repeat(64) : secrets.fulfillment; // dry-run never carries the real fulfillment
   const recordB = (e) => { if (!state.log.includes(e)) state.log.push(e); save(); };
   let openLeft = 0; const rows = [];
-  for (const row of r.set.rows) { const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner); if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); openLeft++; continue; } rows.push(row); }
+  for (const row of r.set.rows) { const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner); if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); openLeft++; continue; }
+    const fw = finishable(e.node, r.now); if (!fw.ok) { say(`skip escrow ${row.seq}: ${fw.why}`); if (fw.later) openLeft++; continue; } rows.push(row); }
   // The shop's presigned LoanPay, and what the ledger says about its funding (memo duckbank/fund).
   const loan0 = await node(c, { index: p.LoanID }); let lp = null; const blobFile = opt("loanpay-blob");
   const si = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: BR, shop: p.shop, escrows: p.escrows, quote: r.quote, minLedger: p.loanSetLedger ?? -1 });
@@ -353,7 +368,7 @@ async function distributeOnce(ctx, secrets, c) {
   const snap = await L.shareSnapshot(p.network, { VaultID: p.VaultID, at: x.fixedAt });
   const split = S.proRata(st.leftover, snap.holders);
   say(`share holders (${snap.source}): ${snap.holders.map((h) => `${h.account} ${h.shares}`).join(", ") || "none"}; dust ${split.dust} to ${split.dustTo || "n/a"}`);
-  if (!split.payouts.length) { say(`no share holders at the snapshot: ${split.unassigned} stays recorded with the broker`); state.leftover = { split, snapshot: { source: snap.source, at: x.fixedAt }, rows: [] }; save(); return { done: true }; }
+  if (!split.payouts.length) { say(noPayoutReason(split, snap.holders)); state.leftover = { split, snapshot: { source: snap.source, at: x.fixedAt }, rows: [] }; save(); return { done: true }; }
   const lines = {}; for (const r of split.payouts) lines[r.account] = await L.hasLine(p.network, r.account, quote);
   let status = S.leftoverStatus(split, { paid: x.leftoverPays, lines, self: brokerAcct });
   const due = status.rows.filter((r) => r.owed > 0 && r.status === "owed"), need = due.reduce((t, r) => t + r.owed, 0);
