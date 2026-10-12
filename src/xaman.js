@@ -29,12 +29,18 @@ export async function connect() { if (!hasKey()) return connectMock(); await loa
 // Mock wallet: used only when no Xaman API key is configured. It never signs or submits anything.
 export function connectMock() { if (hasKey()) throw new Error("real Xaman configured"); Object.assign(wallet, { mode: "mock", account: "rPREVIEWxxxxxxxxxxxxxxxxxxxxxxxxx", network: "mock" }); emit(); }
 export async function disconnect() { if (wallet.mode === "xaman") await sdk.logout(); Object.assign(wallet, { mode: "disconnected", account: null, network: null, lastSign: null }); emit(); }
-async function run(txjson, options, instruction) {
+// expect = the connected account: the payload pins it (txjson.Account + options.signers, both supported by the Xaman payload API),
+// and the signed result is checked against it, so a signature from another account in Xaman is never treated as signed.
+async function run(txjson, options, instruction, expect = null) {
+  if (expect) { if (txjson.Account && txjson.Account !== expect) throw new Error(`payload Account ${txjson.Account} is not the connected account ${expect}`);
+    if (txjson.TransactionType !== "SignIn") txjson = { ...txjson, Account: expect }; options = { ...options, signers: [expect] }; }
   const sub = await sdk.payload.createAndSubscribe({ txjson, options, custom_meta: { instruction } }, (ev) => { if ("signed" in ev.data) return ev.data; });
   if (!sub || !sub.created) throw new Error("Xaman did not create the sign request (transaction type or network may be unsupported)");
   if (sub.created.next?.always) window.open(sub.created.next.always, "_blank", "noopener");
   const r = await sub.resolved; const res = r && r.signed ? await sdk.payload.get(sub.created.uuid) : null;
-  return { signed: !!(r && r.signed), uuid: sub.created.uuid, txid: res?.response?.txid || null, hex: res?.response?.hex || null };
+  const signer = res?.response?.account || null;
+  if (r && r.signed && expect && signer !== expect) throw new Error(`signed by ${signer || "an unknown account"}, not the connected account ${expect}: ignored`);
+  return { signed: !!(r && r.signed), uuid: sub.created.uuid, account: signer, txid: res?.response?.txid || null, hex: res?.response?.hex || null };
 }
 export async function signTest() {
   if (wallet.mode === "mock") { wallet.lastSign = { mock: true, signed: false, note: "mock: nothing signed" }; emit(); return wallet.lastSign; }
@@ -46,5 +52,5 @@ export async function signTx(txjson, net, { submit = true, instruction = "" } = 
   const n = NETWORKS[net]; if (!n || !n.vaultLending) throw new Error("this network is not enabled for vault lending in this build");
   if (wallet.mode === "mock") return { mock: true, signed: false, note: "mock: nothing signed or submitted", txjson };
   if (wallet.mode !== "xaman") throw new Error("connect Xaman first");
-  return run(txjson, { force_network: n.xaman, submit }, instruction || `Duck Bank: ${txjson.TransactionType} on ${n.label}`);
+  return run(txjson, { force_network: n.xaman, submit }, instruction || `Duck Bank: ${txjson.TransactionType} on ${n.label}`, wallet.account);
 }

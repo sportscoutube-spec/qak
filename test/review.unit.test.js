@@ -92,8 +92,9 @@ await t("devnet path requires a test issuer (never the RLUSD code)", () => {
   assert(S.networkGate("devnet", ALL_ON, { issuer: SHOP }).ok); assert.notEqual(NETWORKS.devnet.asset.currency, NETWORKS.mainnet.asset.currency);
   assert.throws(() => P.vaultDeposit({ VaultID: ID, asset: { currency: "X", issuer: "" }, amount: 1 }), /issuer/);
 });
-await xfail("mainnet hard-off is a frozen constant", "NETWORKS is a plain mutable export (config.js:49): code running in the page can flip NETWORKS.mainnet.vaultLending; the ledger (amendments off) is the real gate today", () => {
-  assert(Object.isFrozen(NETWORKS) && Object.isFrozen(NETWORKS.mainnet));
+await t("mainnet hard-off is a frozen constant (fixed: deep Object.freeze in config.js)", () => {
+  assert(Object.isFrozen(NETWORKS) && Object.isFrozen(NETWORKS.mainnet) && Object.isFrozen(NETWORKS.mainnet.asset));
+  assert.throws(() => { "use strict"; NETWORKS.mainnet.vaultLending = true; }); assert.equal(NETWORKS.mainnet.vaultLending, false);
 });
 
 // ---------- 6. Regression ----------
@@ -122,16 +123,25 @@ await t("apply stores a script-like shop name verbatim (escaped at render by mai
 await t("payload value(): an amount that rounds to 0 at 6 decimals is refused [BUG payloads.js:9]", () => {
   assert.throws(() => P.value(0.0000004), /amount/, `value(0.0000004) returned "${(() => { try { return P.value(0.0000004); } catch { return "throw"; } })()}"`);
 });
+await t("payload value(): decimal strings, trailing zeros, precision", () => {
+  assert.equal(P.value(100), "100"); assert.equal(P.value("10.50"), "10.5"); assert.equal(P.value(0.1 + 0.2), "0.3"); assert.equal(P.value(0.000001), "0.000001"); assert.equal(P.value(24.9851034), "24.985103");
+  for (const bad of ["1e3", "abc", "", null, undefined, NaN, -1, 0, Infinity, 1e15, "-2"]) assert.throws(() => P.value(bad), undefined, String(bad));
+});
 await t("payload value(): huge amounts never produce exponent notation [BUG payloads.js:9]", () => {
   const v = (() => { try { return P.value(1e21); } catch { return "throw"; } })(); assert(v === "throw" || !/e/i.test(v), `value(1e21) = "${v}"`);
 });
 await t("enqueue rejects Infinity / negative QAK lock and non-finite amounts [BUG state.js:478-479]", () => {
   const s = S.seed(); assert.throws(() => S.enqueue(s, BR, "first", Infinity, 0), undefined, "amount Infinity accepted");
   assert.throws(() => S.enqueue(s, BR, "first", 10, -5), undefined, "negative QAK lock accepted");
+  assert.throws(() => S.enqueue(s, BR, "first", -1, 0)); assert.throws(() => S.enqueue(s, BR, "first", 10, 1.5)); assert.throws(() => S.enqueue(s, BR, "first", 10, Infinity));
+  assert.throws(() => S.enqueue(s, BR, "first", 10_001, 0), undefined, "above the cap"); assert.equal(S.enqueue(s, BR, "first", 10, 0).length, 1);
 });
 await t("vote: one account cannot vote twice on the same listing [BUG state.js:463-465]", () => {
-  const s = S.seed(); for (let i = 0; i < 2; i++) S.vote(s, "first", true, 600, BR);
+  const s = S.seed(); S.vote(s, "first", true, 600, BR); assert.throws(() => S.vote(s, "first", true, 600, BR), /already voted/);
   assert.notEqual(s.pools[0].stage, "listed", "one 600-QAK account listed the shop by voting twice");
+  assert.throws(() => S.vote(s, "first", true, 900, SHOP, 500), /balance/, "weight above the ledger balance");
+  S.vote(s, "first", true, 500, SHOP, 500); assert.equal(s.pools[0].stage, "listed", "two accounts, 1,100 QAK by balance");
+  const s2 = S.seed(); S.voteCap(s2, "first", 800, 10, BR); assert.throws(() => S.voteCap(s2, "first", 900, 10, BR), /already voted on the cap/);
 });
 await t("localStorage tampering: sanitizeState drops malformed pools and resets holdingVerified", () => {
   const good = S.seed().pools[0];

@@ -71,8 +71,10 @@ await xfail("brief: LoanManage tfLoanDefault is the FIRST bot step", "code impai
 await xfail("brief: LoanManage + EscrowFinish + sale + LoanPay in ONE XLS-56 Batch", "LoanManage/LoanPay are disabled as Batch inner txs (temINVALID_INNER_BATCH, devnet probe)", () => {
   B.buildBatch({ account: BR, sequence: 1, mode: "ALLORNOTHING", base: 10, items: [{ tx: P.loanManage({ LoanID: ID, action: "default" }) }, { tx: P.escrowFinish({ Owner: SHOP, OfferSequence: 1, Condition: COND, Fulfillment: FUL }) }] });
 });
-await xfail("brief: bot key is an XLS-75 delegated account", "the bot signs with BROKER_SEED and dies unless the wallet is LoanBroker.Owner (escrow-bot.js:50,58,165)", async () => {
+await t("S1: the hot run never loads the broker key; LoanManage only via the cold `manage` command (fixed)", async () => {
   const src = (await import("node:fs")).readFileSync(new URL("../bot/escrow-bot.js", import.meta.url), "utf8");
-  assert(/Delegate\s*:/.test(src) && !/BROKER_SEED/.test(src));
+  const once = src.slice(src.indexOf("async function once("), src.indexOf("async function status("));
+  assert(!/P\.loanManage/.test(once), "the hot loop builds no LoanManage"); assert(/the broker key stays cold/.test(src));
+  assert(/die\("BROKER_SEED is set in the hot bot's environment/.test(src));
 });
 done("test/review.bot.test.js");

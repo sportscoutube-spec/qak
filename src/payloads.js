@@ -6,7 +6,17 @@ const req = (c, m) => { if (!c) throw new Error(m); };
 const isId = (x) => typeof x === "string" && /^[0-9A-F]{64}$/.test(x);
 const isAcct = (x) => typeof x === "string" && /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(x);
 // IOU value string: up to 6 decimals, no exponent, no trailing zeros.
-export const value = (x) => { const n = Number(x); req(Number.isFinite(n) && n > 0, "amount must be > 0"); return n.toFixed(6).replace(/\.?0+$/, ""); };
+// IOU value string (XRPL issued-currency rules + app rule of 6 decimals): plain decimal, no exponent, no trailing zeros, > 0 after
+// rounding to 6 decimals, at most 15 significant digits (an IOU keeps 16; 15 keeps a JS double exact). Strings are parsed as decimals.
+export const value = (x) => {
+  const n = typeof x === "string" && /^\s*\d+(\.\d+)?\s*$/.test(x) ? Number(x) : typeof x === "number" ? x : NaN;
+  req(Number.isFinite(n) && n > 0, "amount must be a finite decimal > 0");
+  req(n < 1e15, "amount too large (IOU precision: at most 15 significant digits)");
+  const s = n.toFixed(6).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  req(/^\d+(\.\d{1,6})?$/.test(s) && /[1-9]/.test(s), "amount rounds to 0 at 6 decimals");
+  req(s.replace(".", "").replace(/^0+/, "").length <= 15, "amount has more than 15 significant digits (IOU precision)");
+  return s;
+};
 const iou = (asset, x) => { req(asset && asset.issuer && isAcct(asset.issuer), "asset issuer not set"); return { currency: asset.currency, issuer: asset.issuer, value: value(x) }; };
 
 // VaultCreate (XLS-65 §3.2 + 65.1.4): closed-ended vault on an IOU, AssetsMaximum = cap, Scale for an IOU (0..18).

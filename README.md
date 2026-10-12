@@ -105,6 +105,21 @@ the ledger does not enforce is an **app rule**.
      Loan*. Until then LoanSet is gated on the escrows already being on the ledger.
    - **Payment delegation is deliberately not used**: a delegated Payment cannot be limited to an amount, a currency or a
      destination, so it would let the bot spend all of the shop's RLUSD.
+   - **Three keys.** The *hot* bot account runs the watcher and submits the Batch and the EscrowFinish itself (any account may
+     finish a condition escrow; the XRP still goes to the broker). The *broker* key stays cold: it signs LoanManage,
+     LoanBrokerSet and cover, and once grants the hot account `OfferCreate` only (XLS-75 DelegateSet; no Payment, no
+     PaymentBurn, no Vault*/Loan*; a delegated Payment or EscrowCreate fails `terNO_DELEGATE_PERMISSION`, devnet probe
+     2026-10-12). The bot asks the operator to run `manage` for impair/default instead of signing it. The funding Payment to
+     the shop and the leftover payments need a separately approved *payer* key (a BatchSigner), because a Payment grant cannot
+     be limited. Tradeoff: if the payer key is the broker key and it is kept online, S1 gains nothing for that leg; keep it on a
+     separate, low-balance account where you can.
+   - **The shop can void its presigned LoanPay** (reuse the Sequence or Ticket, or move the funds away) after it receives the
+     funding Payment. No XRPL primitive ties a payment to a later LoanPay, and a Check or token escrow would hand the funds to the
+     shop in the same way. Mitigation: the bot prefers a Ticket-based LoanPay, checks before funding that the blob's
+     Sequence/Ticket is still live, tags the funding with the memo `duckbank/fund` (LoanID + blob hash) and reads it back from the
+     ledger for idempotency, uses a tight LastLedgerSequence, submits the LoanPay right after the funding validates, and funds
+     once only: if a funded blob is voided, no more funding goes to that shop and the amount is recorded as owed by the shop.
+     Residual risk: a racing shop can keep one funding (at most one installment) per loan.
 
 Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file kept off-ledger.
 
@@ -152,8 +167,10 @@ Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file k
 cd bot && npm install
 node escrow-bot.js condition --out ~/duckbank/escrow-secret.json
 node escrow-bot.js status --pool ~/duckbank/pool.json
-BROKER_SEED=… ESCROW_FULFILLMENT=… node escrow-bot.js run --pool ~/duckbank/pool.json --dry-run
-node escrow-bot.js run --pool ~/duckbank/pool.json --secrets ~/duckbank/bot-secrets.json --loanpay-blob blob.txt --watch 10
+node escrow-bot.js grant  --pool ~/duckbank/pool.json --broker-secrets ~/duckbank/broker.json --hot rHOT…   # cold, once: OfferCreate only
+HOT_SEED=… ESCROW_FULFILLMENT=… node escrow-bot.js run --pool ~/duckbank/pool.json --dry-run   # dry-run never prints the fulfillment
+node escrow-bot.js run --pool ~/duckbank/pool.json --secrets ~/duckbank/hot-secrets.json --payer-secrets ~/duckbank/payer.json --loanpay-blob blob.txt --watch 10
+node escrow-bot.js manage --pool ~/duckbank/pool.json --broker-secrets ~/duckbank/broker.json   # cold: the impair/default the bot asked for
 node escrow-bot.js distribute --pool ~/duckbank/pool.json --dry-run        # leftover to lenders, pro rata (run also calls it at the end)
 ```
 Seeds come only from env or a 0600 secrets file outside the repo, and are never logged. Mainnet and testnet are refused.

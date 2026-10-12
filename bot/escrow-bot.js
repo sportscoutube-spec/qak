@@ -6,19 +6,27 @@
 //        make a 32-byte preimage, save {condition, fulfillment} to that file (mode 0600), print the Condition only
 //   node bot/escrow-bot.js status --pool <pool.json>
 //        read-only: escrows, live ratio, add/default lines, window state and the four sale steps
-//   node bot/escrow-bot.js run --pool <pool.json> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>] [--max-minutes <m>]
-//        1 LoanManage tfLoanImpair once a payment is overdue (its own tx: Loan* cannot be a Batch inner tx)
-//        2+3 one XLS-56 Batch, ALLORNOTHING: EscrowFinish every escrow + OfferCreate (fill-or-kill + sell, limit = quote − 3%) + Payment of the
-//            shop's presigned LoanPay amount to the shop when that amount is covered by the guaranteed minimum output (all or none apply)
-//        4 submit the shop's own presigned LoanPay (XLS-66: only Loan.Borrower may LoanPay)  then LoanManage tfLoanDefault for the rest
-//        then, once the loan is defaulted or closed, `distribute` (below)
-//   node bot/escrow-bot.js distribute --pool <pool.json> [--dry-run] [--secrets <file>]
+//   node bot/escrow-bot.js grant --pool <pool.json> --broker-secrets <file>          (COLD broker key, once)
+//        DelegateSet broker -> hot account with exactly [OfferCreate]. No Payment, no PaymentBurn, no Vault*/Loan* (non-delegable anyway).
+//   node bot/escrow-bot.js manage --pool <pool.json> --action impair|default --broker-secrets <file>   (COLD broker key)
+//        LoanManage only, after the ledger gate (impair: payment overdue; default: past grace). Signs nothing else.
+//   node bot/escrow-bot.js run --pool <pool.json> [--dry-run] [--secrets <hot file>] [--payer-secrets <file>] [--loanpay-blob <file>] [--watch <s>]
+//        HOT account only. It never holds the broker key.
+//        2+3 one XLS-56 Batch, ALLORNOTHING, outer tx from the hot account: EscrowFinish every escrow (the hot account submits it; the XRP
+//            goes to the escrow Destination = the broker) + OfferCreate as the broker via the XLS-75 OfferCreate grant (fill-or-kill + sell,
+//            limit = quote − 3%) + [only with --payer-secrets] the Payment of the shop's presigned LoanPay amount (memo duckbank/fund)
+//        4 submit the shop's own presigned LoanPay right after the funding validates (XLS-66: only Loan.Borrower may LoanPay).
+//        LoanManage (impair before, default after) is requested from the operator: `manage` with the cold broker key.
+//   node bot/escrow-bot.js distribute --pool <pool.json> [--dry-run] [--payer-secrets <file>]
 //        leftover proceeds (not put into the loan by LoanPay) to the pool's lenders, pro rata to their vault MPT shares at the default
 //        (or at the LoanPay that closed the loan): a Payment in the vault asset from the broker wallet to each lender, sent in XLS-56
 //        Batches of up to 8 Payments (INDEPENDENT mode), skipping any lender already paid (memo duckbank/leftover + LoanID). App rule.
 //
-// Secrets: BROKER_SEED and ESCROW_FULFILLMENT from the environment, or --secrets <json outside the repo, mode 0600> with
-// {"brokerSeed": "...", "fulfillment": "..."}. Secrets are never printed or written anywhere else. Mainnet and testnet are refused.
+// Keys (S1 split). hot: HOT_SEED + ESCROW_FULFILLMENT, or --secrets {"hotSeed","fulfillment"}. broker (cold): BROKER_SEED or --broker-secrets
+// {"brokerSeed"}; used only by `grant` and `manage`. payer (separately approved): PAYER_SEED or --payer-secrets {"payerSeed"}; signs the
+// broker's Payments (shop funding, leftover). It is the broker key itself, or an account the broker granted Payment, which XLS-75 cannot
+// limit to an amount, currency or destination (so that is a full-spend key; keep it cold or approve each run). All files outside the repo,
+// mode 0600. Secrets are never printed (dry-run output redacts the fulfillment). Mainnet and testnet are refused.
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -46,17 +54,59 @@ export const conditionOf = (preimage) => ("A0258020" + crypto.createHash("sha256
 export const fulfillmentOf = (preimage) => ("A0" + hx(preimage.length + 2) + "80" + hx(preimage.length) + preimage.toString("hex")).toUpperCase();
 export const conditionFromFulfillment = (ful) => { if (!/^A0228020[0-9A-F]{64}$/i.test(ful)) throw new Error("bad fulfillment"); return conditionOf(Buffer.from(ful.slice(8), "hex")); };
 
-function loadSecrets(needed) {
-  let brokerSeed = process.env.BROKER_SEED || null, fulfillment = process.env.ESCROW_FULFILLMENT || null;
-  const file = opt("secrets");
-  if (file) {
-    if (insideRepo(file)) die("refusing a secrets file inside the repo; keep it outside " + REPO);
-    const st = fs.statSync(file); if (st.mode & 0o077) die("secrets file must be mode 0600 (chmod 600)");
-    const j = JSON.parse(fs.readFileSync(file, "utf8")); brokerSeed = j.brokerSeed || brokerSeed; fulfillment = j.fulfillment || fulfillment;
-  }
-  if (needed && !brokerSeed) die("no broker seed: set BROKER_SEED or pass --secrets <file>");
-  return { wallet: brokerSeed ? xrpl.Wallet.fromSeed(brokerSeed) : null, fulfillment };
+function readSecretFile(k) {
+  const file = opt(k); if (!file || file === true) return {};
+  if (insideRepo(file)) die(`refusing a secrets file inside the repo (--${k}); keep it outside ` + REPO);
+  const st = fs.statSync(file); if (st.mode & 0o077) die(`--${k} file must be mode 0600 (chmod 600)`);
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
+// role: "hot" (run), "broker" (grant, manage), "payer" (distribute). The hot run refuses a broker seed: the broker key stays cold.
+function loadSecrets(role, needed) {
+  const hot = readSecretFile("secrets"), brk = readSecretFile("broker-secrets"), pay = readSecretFile("payer-secrets");
+  if (hot.brokerSeed) die("the hot secrets file holds a brokerSeed: the broker key stays cold (use `grant`/`manage` with --broker-secrets)");
+  const hotSeed = hot.hotSeed || process.env.HOT_SEED || null, fulfillment = hot.fulfillment || process.env.ESCROW_FULFILLMENT || null;
+  const brokerSeed = role === "broker" ? brk.brokerSeed || process.env.BROKER_SEED || null : null;
+  const payerSeed = pay.payerSeed || process.env.PAYER_SEED || null;
+  if (role === "hot" && process.env.BROKER_SEED) die("BROKER_SEED is set in the hot bot's environment: the broker key stays cold; unset it");
+  const w = (x) => (x ? xrpl.Wallet.fromSeed(x) : null);
+  const out = { wallet: w(hotSeed), broker: w(brokerSeed), payer: w(payerSeed), fulfillment };
+  if (needed && role === "hot" && !out.wallet) die("no hot account: set HOT_SEED or pass --secrets <file> with hotSeed");
+  if (needed && role === "broker" && !out.broker) die("no broker key: set BROKER_SEED or pass --broker-secrets <file>");
+  if (needed && role === "payer" && !out.payer) die("no payer key: set PAYER_SEED or pass --payer-secrets <file> (the broker key or its Payment delegate)");
+  return out;
+}
+// The fulfillment must never reach logs: dry-run prints a copy with it redacted.
+export const redact = (x) => JSON.parse(JSON.stringify(x, (k, v) => (k === "Fulfillment" && typeof v === "string" ? "[redacted]" : v)));
+// XLS-75 Delegate entry broker -> hot: the bot needs exactly OfferCreate. Anything broader (Payment above all) is refused.
+export const GRANT = ["OfferCreate"];
+export function checkGrant(entry) {
+  if (!entry) return "no XLS-75 grant from the broker to the hot account (run `grant` with the cold broker key)";
+  const perms = (entry.Permissions || []).map((x) => x.Permission?.PermissionValue);
+  const missing = GRANT.filter((g) => !perms.includes(g)), extra = perms.filter((x) => !GRANT.includes(x));
+  return missing.length ? `grant lacks ${missing.join(", ")}` : extra.length ? `grant is broader than needed (${extra.join(", ")}); narrow it to [${GRANT.join(", ")}]` : null;
+}
+// The broker's own account signs as itself; any other payer acts for the broker through a Payment delegation (Delegate field).
+export const asBroker = (tx, broker, signer) => ({ ...tx, Account: broker, ...(signer && signer !== broker ? { Delegate: signer } : {}) });
+// S2: the presigned LoanPay's slot (TicketSequence, or Sequence) must still be unused right before the bot funds the shop.
+export const blobSlot = (tx) => (tx.TicketSequence ? { kind: "ticket", value: tx.TicketSequence } : { kind: "sequence", value: tx.Sequence });
+export function slotStatus(tx, { accountSequence, ticketExists }) {
+  const s = blobSlot(tx);
+  if (s.kind === "ticket") return ticketExists ? { ok: true, ...s } : { ok: false, ...s, why: `Ticket ${s.value} is gone (used or never created)` };
+  return accountSequence === s.value ? { ok: true, ...s } : { ok: false, ...s, why: `shop Sequence is ${accountSequence}, the blob needs ${s.value}` };
+}
+async function slotLive(c, tx) {
+  const ai = (await c.request({ command: "account_info", account: tx.Account, ledger_index: "current" })).result.account_data;
+  let ticketExists = false; if (tx.TicketSequence) ticketExists = !!(await node(c, { ticket: { account: tx.Account, ticket_seq: tx.TicketSequence } }));
+  return slotStatus(tx, { accountSequence: ai.Sequence, ticketExists });
+}
+// Funding decision from the ledger (memo duckbank/fund = LoanID:blobHash), not the local state file:
+//  paid:      this blob's LoanPay is already on the ledger;  funded: a funding Payment for this blob is on the ledger;
+//  forfeited: an earlier blob was funded and its LoanPay never landed (the shop kept that funding): the bot funds this loan no more.
+export function fundingState({ fundPays = [], loanPays = [], blobHash }) {
+  const forfeited = fundPays.filter((f) => f.blobHash !== blobHash && !loanPays.includes(f.blobHash));
+  return { paid: loanPays.includes(blobHash), funded: fundPays.some((f) => f.blobHash === blobHash), forfeited, owedByShop: forfeited.reduce((t, f) => t + f.amount, 0) };
+}
+
 function loadPool() {
   const f = opt("pool"); if (!f || f === true) die("--pool <pool.json> required");
   const p = JSON.parse(fs.readFileSync(f, "utf8")); if (!NETS[p.network]) die(`network ${p.network} refused: this build runs the bot on devnet only (mainnet is hard-off)`);
@@ -104,8 +154,8 @@ function printStatus(r, m, plan) {
   say(r.owed ? `owed after cover ${r.owed.net.toFixed(6)} (DefaultAmount ${r.owed.DefaultAmount} − cover payable ${r.owed.coverPayable.toFixed(6)}); ratio ${r.ratio == null ? "n/a" : r.ratio.toFixed(2) + "%"}` : "no open loan balance");
   say(`margin: ${m.state} (${m.label}); plan: ${plan.why}`);
 }
-async function submit(c, wallet, tx, st, label, save) {
-  const prepared = await c.autofill({ ...tx, Account: wallet.address }); prepared.LastLedgerSequence += 20;
+async function submit(c, wallet, tx, st, label, save, { lls = 20 } = {}) {
+  const prepared = await c.autofill({ Account: wallet.address, ...tx }); prepared.LastLedgerSequence = (await c.request({ command: "ledger_current" })).result.ledger_current_index + lls;
   const signed = wallet.sign(prepared); st.log.push({ at: new Date().toISOString(), label, hash: signed.hash, pending: true }); save(); // persist before submit
   let res; try { res = await c.submitAndWait(signed.tx_blob); } catch (e) { const t = await c.request({ command: "tx", transaction: signed.hash }).catch(() => null); if (t?.result?.validated) res = t; else throw e; }
   const code = (res.result.meta || res.result.metaData).TransactionResult; Object.assign(st.log[st.log.length - 1], { pending: false, result: code }); save();
@@ -159,76 +209,90 @@ async function once(c, ctx, secrets) {
   const m = S.marginState({ ratio: r.ratio, belowAddSince: state.belowAddSince, now: r.now, windowSec: w.ADD_WINDOW_SECONDS, add: w.ADD_LINE_PCT, def: w.DEFAULT_LINE_PCT });
   const plan = S.botPlan({ loan: r.loan, margin: m, now: r.now });
   printStatus(r, m, plan);
-  const wallet = secrets.wallet; if (wallet && wallet.address !== r.broker.Owner) die("the broker seed does not match LoanBroker.Owner");
-  const act = async (label, tx) => { if (DRY) { say(`[dry-run] would submit ${label}:`, JSON.stringify(tx)); return { code: "dry-run" }; } return submit(c, wallet, tx, state, label, save); };
+  const BR = r.broker.Owner, hot = secrets.wallet, payer = secrets.payer;
+  if (hot && hot.address === BR) die("the hot account is the broker: the broker key stays cold; run the bot from a separate account with the OfferCreate grant");
+  if (hot) { const g = checkGrant(await node(c, { delegate: { account: BR, authorize: hot.address } })); if (g) die(g); }
+  if (payer && payer.address !== BR) say(`payer ${payer.address} acts for the broker through a Payment delegation: XLS-75 cannot limit it to an amount, currency or destination`);
+  const ask = (what) => { say(`OPERATOR: ${what} needs the cold broker key: node bot/escrow-bot.js manage --pool <pool.json> --action ${what} --broker-secrets <file>`); state.requests = [...new Set([...(state.requests || []), what])]; save(); };
   if (!r.loan) return { done: true, why: "Loan not on the ledger" };
-  // Step 1: mark.
-  if (plan.mark) await act("1 LoanManage tfLoanImpair", P.loanManage({ LoanID: p.LoanID, action: "impair" }));
+  // Step 1: mark (cold broker key).
+  if (plan.mark) { ask("impair"); return { done: false, why: "waiting for the operator's LoanManage impair" }; }
   if (!plan.sell && !state.saleStartedAt) return { done: false, why: plan.why };
   if (!state.saleStartedAt && !DRY) { state.saleStartedAt = r.now; save(); }
   const saleEnds = (state.saleStartedAt ?? r.now) + w.SALE_WINDOW_SECONDS;
-  // Steps 2+3 (+ the Payment to the shop): one ALLORNOTHING Batch.
   if (!DRY && !secrets.fulfillment) die("no fulfillment: set ESCROW_FULFILLMENT or pass --secrets");
   if (secrets.fulfillment && conditionFromFulfillment(secrets.fulfillment) !== p.condition.toUpperCase()) die("the fulfillment does not match the pool's Condition");
-  const ful = secrets.fulfillment || "A0228020" + "0".repeat(64);
+  const ful = DRY ? "A0228020" + "0".repeat(64) : secrets.fulfillment; // dry-run never carries the real fulfillment
   const recordB = (e) => { if (!state.log.includes(e)) state.log.push(e); save(); };
   let openLeft = 0; const rows = [];
   for (const row of r.set.rows) { const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner); if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); openLeft++; continue; } rows.push(row); }
-  // The shop's presigned LoanPay (read now, so its amount can ride in the Batch).
+  // The shop's presigned LoanPay, and what the ledger says about its funding (memo duckbank/fund).
   const loan0 = await node(c, { index: p.LoanID }); let lp = null; const blobFile = opt("loanpay-blob");
+  const si = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: BR, shop: p.shop, escrows: p.escrows, quote: r.quote, minLedger: p.loanSetLedger ?? -1 });
   if (loan0 && loan0.PaymentRemaining > 0 && !(loan0.Flags & FLAGS.lsfLoanDefault)) {
     const { late, due } = dueNow(loan0, r.now);
     if (blobFile && blobFile !== true && fs.existsSync(blobFile)) { const blob = fs.readFileSync(blobFile, "utf8").trim(), tx = xrpl.decode(blob), hash = xrpl.hashes.hashSignedTx(blob);
       const bad = checkLoanPayBlob(tx, { loan: loan0, LoanID: p.LoanID, quote: r.quote, due, late });
-      if (bad) say(`4 LoanPay blob refused: ${bad}`); else if (!(state.loanPays || []).includes(hash)) lp = { blob, hash, amt: Number(tx.Amount.value), late, due }; }
+      const fs0 = fundingState({ fundPays: si.fundPays, loanPays: si.loanPays, blobHash: hash });
+      if (bad) say(`4 LoanPay blob refused: ${bad}`);
+      else if (fs0.paid) say("4 LoanPay: this blob is already on the ledger");
+      else { lp = { blob, hash, tx, amt: Number(tx.Amount.value), late, due, ...fs0 }; if (blobSlot(tx).kind === "sequence") say("4 LoanPay blob uses a Sequence: ask the shop for a Ticket-based blob (TicketSequence) so its other activity cannot void it"); } }
     else if (blobFile && rows.length && r.now < saleEnds - w.SALE_WINDOW_SECONDS / 2) return { done: false, why: `waiting for the shop's presigned LoanPay (at least ${due}) so its funding can ride in the Batch` };
   }
+  // May the bot fund the shop now? Ledger-derived: never twice for one blob, never again after a forfeit, only with the payer key and a live slot.
+  const canFund = async () => { if (!lp || lp.funded || !payer) return { ok: false, why: !lp ? "no blob" : lp.funded ? "already funded (ledger)" : "no payer key: funding needs the separately approved payer (--payer-secrets)" };
+    if (lp.forfeited.length) return { ok: false, why: `the shop kept an earlier funding of ${lp.owedByShop} without its LoanPay landing (${lp.forfeited.map((f) => f.hash).join(", ")}): no more funding for this loan; recorded as owed by the shop` };
+    const sl = await slotLive(c, lp.tx); return sl.ok ? { ok: true } : { ok: false, why: `presigned LoanPay is void before funding (${sl.why}): no funding sent` }; };
+  const fundTx = (amt) => asBroker({ TransactionType: "Payment", Destination: loan0.Borrower, Amount: { ...r.quote, value: P.value(amt) }, Memos: [L.fundMemo(p.LoanID, lp.hash)] }, BR, payer?.address);
   const unsold = state.finishedDrops - state.soldDrops;
   if (rows.length || unsold > 0) {
+    const cf = lp ? await canFund() : { ok: false }; if (lp && !cf.ok) say(`4 funding in the Batch: no (${cf.why})`);
     const plan2 = planSaleBatch({ rows, unsoldDrops: unsold > 1000 ? unsold : 0, quoteFor: (xrp) => S.sellQuote({ ...r.market, xrp }), quote: r.quote, slippagePct: w.SELL_MAX_SLIPPAGE_PCT,
-      loanPayAmount: lp && !(state.funded || []).includes(lp.hash) ? lp.amt : null, condition: p.condition, fulfillment: ful });
+      loanPayAmount: cf.ok ? lp.amt : null, condition: p.condition, fulfillment: ful });
     if (plan2.none) { say(`2+3 sell: ${plan2.none}; step stuck`); openLeft += rows.length; }
     else {
-      for (const it of plan2.items) if (it.shopPay) it.tx.Destination = loan0.Borrower;
-      say(`2+3 plan: ${plan2.items.length} inner txs, sell ${plan2.drops / S.DROPS} XRP (quote ${plan2.quote.toFixed(6)} via ${plan2.source}, minimum ${plan2.minOut}); ${plan2.why}${plan2.pre.length ? `; ${plan2.pre.length} escrow(s) beyond the 8-tx limit are finished first` : ""}`);
-      if (DRY) say("[dry-run] would submit Batch ALLORNOTHING:", JSON.stringify(plan2.items.map((x) => x.tx)));
+      const bseq = (await c.request({ command: "account_info", account: BR, ledger_index: "current" })).result.account_data.Sequence; let k = 0;
+      const items = plan2.items.map((it) => it.row ? { tx: it.tx, row: it.row } : it.shopPay ? { tx: fundTx(plan2.pay), account: BR, sequence: bseq + k++, shopPay: true }
+        : { tx: asBroker(it.tx, BR, hot?.address), account: BR, sequence: bseq + k++ });
+      say(`2+3 plan: ${items.length} inner txs, sell ${plan2.drops / S.DROPS} XRP as the broker via the OfferCreate grant (quote ${plan2.quote.toFixed(6)} via ${plan2.source}, minimum ${plan2.minOut}); ${plan2.why}${plan2.pre.length ? `; ${plan2.pre.length} escrow(s) beyond the 8-tx limit are finished first` : ""}`);
+      if (DRY) say("[dry-run] would submit Batch ALLORNOTHING:", JSON.stringify(redact(items.map((x) => x.tx))));
       else {
-        // Escrows beyond the 8-tx limit: finish them first (INDEPENDENT batches of up to 8, or a single tx), then sell everything in the main Batch.
         for (const grp of B.chunk(plan2.pre, B.MAX_INNER)) {
-          if (grp.length === 1) { const res = await submit(c, wallet, grp[0].tx, state, `2 EscrowFinish ${grp[0].row.owner}/${grp[0].row.seq} (beyond the Batch limit)`, save); if (res.code === "tesSUCCESS") { state.finishedDrops += grp[0].row.drops; save(); } continue; }
-          const res = await B.submitBatch(c, wallet, { mode: "INDEPENDENT", items: grp.map((x) => ({ tx: x.tx })), record: recordB, label: `2 Batch INDEPENDENT: EscrowFinish ×${grp.length} (beyond the main Batch's limit)` });
+          if (grp.length === 1) { const res = await submit(c, hot, grp[0].tx, state, `2 EscrowFinish ${grp[0].row.owner}/${grp[0].row.seq} (beyond the Batch limit)`, save); if (res.code === "tesSUCCESS") { state.finishedDrops += grp[0].row.drops; save(); } continue; }
+          const res = await B.submitBatch(c, hot, { mode: "INDEPENDENT", items: grp.map((x) => ({ tx: x.tx })), record: recordB, label: `2 Batch INDEPENDENT: EscrowFinish ×${grp.length} (beyond the main Batch's limit)` });
           grp.forEach((x, i) => { if (res.inners[i].ok) state.finishedDrops += x.row.drops; }); save(); say(`${res.check.ok ? "OK" : "!!"} pre-finish Batch ${res.hash} ${res.check.problems.join("; ")}`);
         }
-        const res = await B.submitBatch(c, wallet, { mode: "ALLORNOTHING", items: plan2.items.map((x) => ({ tx: x.tx })), record: recordB, label: `2+3 Batch ALLORNOTHING: EscrowFinish ×${plan2.items.filter((x) => x.row).length} + OfferCreate FoK (min ${plan2.minOut})${plan2.pay ? ` + Payment ${plan2.pay} to the shop` : ""}` });
-        say(`${res.check.ok ? "OK" : "!!"} 2+3 Batch ${res.hash}: outer ${res.result}; inner ${res.check.rows.map((x, i) => `${plan2.items[i].tx.TransactionType} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
+        const res = await B.submitBatch(c, hot, { mode: "ALLORNOTHING", items: items.map(({ tx, account, sequence }) => ({ tx, account, sequence })), signerWallets: plan2.pay ? [payer] : [], record: recordB,
+          label: `2+3 Batch ALLORNOTHING: EscrowFinish ×${items.filter((x) => x.row).length} + OfferCreate FoK as the broker (min ${plan2.minOut})${plan2.pay ? ` + Payment ${plan2.pay} to the shop (payer key)` : ""}` });
+        say(`${res.check.ok ? "OK" : "!!"} 2+3 Batch ${res.hash}: outer ${res.result}; inner ${res.check.rows.map((x, i) => `${items[i].tx.TransactionType} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
         if (res.check.problems.length) say("   batch problems:", res.check.problems.join("; "));
         if (res.check.ok) {
-          plan2.items.forEach((x) => { if (x.row) state.finishedDrops += x.row.drops; });
-          const off = res.inners[plan2.items.findIndex((x) => x.tx.TransactionType === "OfferCreate")];
-          const sold = -L.balanceDelta(off.meta, wallet.address, "XRP"), got = L.balanceDelta(off.meta, wallet.address, r.quote);
+          items.forEach((x) => { if (x.row) state.finishedDrops += x.row.drops; });
+          const off = res.inners[items.findIndex((x) => x.tx.TransactionType === "OfferCreate")];
+          const sold = -L.balanceDelta(off.meta, BR, "XRP"), got = L.balanceDelta(off.meta, BR, r.quote);
           state.soldDrops += Math.max(0, sold); state.proceeds += got;
-          if (plan2.pay) { (state.funded ||= []).push(lp.hash); state.shopFunded = (state.shopFunded || 0) + plan2.pay; }
+          if (plan2.pay) { lp.funded = true; state.shopFunded = (state.shopFunded || 0) + plan2.pay; }
           save(); say(`sold ${sold / S.DROPS} XRP for ${got} (guaranteed minimum ${plan2.minOut})${plan2.pay ? `, paid ${plan2.pay} to the shop in the same Batch` : ""}`);
         } else { openLeft += rows.length; say("the Batch applied nothing (ALLORNOTHING); it is retried on the next pass with a fresh quote"); }
       }
     }
   }
-  // Step 4: the shop's presigned LoanPay. If its funding was not in the Batch (amount above the guaranteed minimum), fund it now from the
-  // actual proceeds when they cover it (two separate txs, not atomic).
+  // Step 4: fund (if not in the Batch) and submit the shop's presigned LoanPay at once. Funding Payment: memo duckbank/fund, LastLedgerSequence +3.
   if (lp && !DRY) {
-    const left = state.proceeds - state.delivered; let funded = (state.funded || []).includes(lp.hash);
-    if (!funded && left + 1e-9 >= lp.amt) { const pay = await submit(c, wallet, { TransactionType: "Payment", Destination: loan0.Borrower, Amount: { ...r.quote, value: P.value(lp.amt) } }, state, `4a Payment ${lp.amt} to the shop (outside the Batch: amount above the guaranteed minimum)`, save);
-      if (pay.code === "tesSUCCESS") { (state.funded ||= []).push(lp.hash); funded = true; save(); } }
-    else if (!funded) say(`4 LoanPay: proceeds left ${left} are below the presigned ${lp.amt}; LoanPay takes no partial payment, so this part is a shortfall`);
-    if (funded) { const res = await submitBlob(c, lp.blob, state, `4 LoanPay ${lp.amt} (shop-presigned${lp.late ? ", tfLoanLatePayment" : ""})`, save);
-      (state.loanPays ||= []).push(lp.hash); if (res.code === "tesSUCCESS") state.delivered += lp.amt; save(); }
-  } else if (lp && DRY) say(`[dry-run] would submit the shop's presigned LoanPay ${lp.amt}`);
-  // Default the rest when the ledger allows it and nothing more can be delivered (or the sale window is over).
+    const left = state.proceeds - state.delivered;
+    if (!lp.funded) { const cf = await canFund();
+      if (cf.ok && left + 1e-9 >= lp.amt) { const pay = await submit(c, payer, fundTx(lp.amt), state, `4a Payment ${lp.amt} to the shop (memo duckbank/fund; payer key)`, save, { lls: 3 }); if (pay.code === "tesSUCCESS") lp.funded = true; }
+      else say(`4 LoanPay: not funded (${cf.ok ? `proceeds left ${left} are below the presigned ${lp.amt}; LoanPay takes no partial payment, so this part is a shortfall` : cf.why})`); }
+    if (lp.funded) { const sl = await slotLive(c, lp.tx);
+      if (!sl.ok) say(`!! 4 LoanPay void after funding (${sl.why}): the shop kept ${lp.amt}; recorded as owed by the shop, no more funding for this loan`);
+      else { const res = await submitBlob(c, lp.blob, state, `4 LoanPay ${lp.amt} (shop-presigned${lp.late ? ", tfLoanLatePayment" : ""}, ${sl.kind})`, save);
+        (state.loanPays ||= []).push(lp.hash); if (res.code === "tesSUCCESS") state.delivered += lp.amt; else say(`!! 4 LoanPay ${res.code}: the shop kept the funding; recorded as owed by the shop`); save(); } }
+  } else if (lp && DRY) say(`[dry-run] would fund (payer key, after the slot check) and submit the shop's presigned LoanPay ${lp.amt}`);
+  // Default the rest when the ledger allows it and nothing more can be delivered (or the sale window is over): cold broker key.
   const l2 = await node(c, { index: p.LoanID });
   if (l2 && l2.PaymentRemaining > 0 && !(l2.Flags & FLAGS.lsfLoanDefault)) {
-    // Wait while escrows are still open, finished XRP is unsold, or proceeds can still pay an installment, unless the sale window is over.
     const g = S.defaultGate(l2, r.now), more = openLeft > 0 || state.finishedDrops > state.soldDrops + 1000 || state.proceeds - state.delivered >= dueNow(l2, r.now).due;
-    if (g.ok && (!more || r.now > saleEnds)) { await act("LoanManage tfLoanDefault (remaining shortfall)", P.loanManage({ LoanID: p.LoanID, action: "default" })); return { done: !DRY, why: "defaulted" }; }
+    if (g.ok && (!more || r.now > saleEnds)) { ask("default"); return { done: false, why: "waiting for the operator's LoanManage default" }; }
     return { done: false, why: g.ok ? (openLeft ? "escrows still open" : "XRP or proceeds left to deliver") : `default not allowed yet (${g.reason})` };
   }
   return { done: true, why: l2 ? (l2.Flags & FLAGS.lsfLoanDefault ? "defaulted" : "settled") : "loan gone" };
@@ -247,24 +311,42 @@ async function status() {
   } finally { await c.disconnect(); }
 }
 async function run() {
-  const ctx = loadPool(), secrets = loadSecrets(!DRY), c = await connect(ctx.p.network);
+  const ctx = loadPool(), secrets = loadSecrets("hot", !DRY), c = await connect(ctx.p.network);
   const watch = Number(opt("watch", 0)) || 0, until = Date.now() + (Number(opt("max-minutes", 30)) || 30) * 60000;
   try { let r; for (;;) { r = await once(c, ctx, secrets); say("->", r.why); if (r.done || !watch || DRY || Date.now() > until) break; await new Promise((res) => setTimeout(res, watch * 1000)); }
-    if (r?.done && /defaulted|settled|loan gone/.test(r.why)) { say("loan defaulted or closed: distributing any leftover to the lenders, pro rata"); await distributeOnce(ctx, secrets, c); } }
+    if (r?.done && /defaulted|settled|loan gone/.test(r.why)) { if (secrets.payer) { say("loan defaulted or closed: distributing any leftover to the lenders, pro rata (payer key)"); await distributeOnce(ctx, secrets, c); } else say("loan defaulted or closed: run `distribute --payer-secrets <file>` for the leftover"); } }
   finally { await c.disconnect(); }
 }
-// Leftover proceeds to the pool's lenders, pro rata to their vault MPT shares at the snapshot (the default, or the LoanPay that closed
-// the loan). App rule the broker promises: a direct Payment in the vault asset from the broker wallet, outside the vault and the loan.
-// Amounts are floored to 0.000001; the rounding remainder goes to the largest holder. A holder with no trust line for the asset cannot
-// receive: its amount stays recorded as owed. Each Payment carries the memo "duckbank/leftover" + LoanID so the app can show it.
+// Cold broker key: LoanManage only, after the ledger gate.
+async function manage() {
+  const ctx = loadPool(), action = opt("action"); if (!["impair", "default"].includes(action)) die("--action impair|default required");
+  const secrets = loadSecrets("broker", !DRY), c = await connect(ctx.p.network);
+  try { const loan = await node(c, { index: ctx.p.LoanID }), broker = await node(c, { index: ctx.p.LoanBrokerID }); if (!loan || !broker) die("Loan or LoanBroker not found");
+    if (secrets.broker && secrets.broker.address !== broker.Owner) die("the broker seed does not match LoanBroker.Owner");
+    const now = (await c.request({ command: "ledger", ledger_index: "validated" })).result.ledger.close_time, g = action === "impair" ? S.impairGate(loan, now) : S.defaultGate(loan, now);
+    if (!g.ok) die(`LoanManage ${action} not allowed yet: ${g.reason}`);
+    const tx = P.loanManage({ LoanID: ctx.p.LoanID, action }); if (DRY) { say("[dry-run] would submit", JSON.stringify(tx)); return; }
+    await submit(c, secrets.broker, tx, ctx.state, `LoanManage ${action} (cold broker key)`, ctx.save);
+    ctx.state.requests = (ctx.state.requests || []).filter((x) => x !== action); ctx.save(); }
+  finally { await c.disconnect(); }
+}
+// Cold broker key, once: XLS-75 grant of exactly [OfferCreate] to the hot account (DelegateSet replaces the whole permission set).
+async function grant() {
+  const ctx = loadPool(), hot = opt("hot"); if (!hot || hot === true || !/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(hot)) die("--hot <hot account address> required");
+  const secrets = loadSecrets("broker", !DRY), c = await connect(ctx.p.network);
+  try { const tx = { TransactionType: "DelegateSet", Authorize: hot, Permissions: GRANT.map((v) => ({ Permission: { PermissionValue: v } })) };
+    if (DRY) { say("[dry-run] would submit", JSON.stringify(tx)); return; } await submit(c, secrets.broker, tx, ctx.state, `DelegateSet broker -> ${hot} [${GRANT.join(", ")}]`, ctx.save); }
+  finally { await c.disconnect(); }
+}
+
 async function distributeOnce(ctx, secrets, c) {
   const { p, state, save } = ctx;
   const broker = await node(c, { index: p.LoanBrokerID }); const vault = await node(c, { index: p.VaultID });
   if (!vault) throw new Error("Vault not found (needed for the share snapshot)");
-  const brokerAcct = broker ? broker.Owner : secrets.wallet?.address; if (!brokerAcct) die("broker account unknown: the LoanBroker is gone, pass the broker seed");
-  if (secrets.wallet && secrets.wallet.address !== brokerAcct) die("the broker seed does not match LoanBroker.Owner");
+  const brokerAcct = broker ? broker.Owner : p.broker || null; if (!brokerAcct) die("broker account unknown: the LoanBroker is gone; set \"broker\" in pool.json");
+  const payer = secrets.payer; if (!payer && !DRY) die("no payer key: leftover Payments are signed by the separately approved payer (--payer-secrets)");
   const quote = { currency: vault.Asset.currency, issuer: vault.Asset.issuer };
-  const x = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote });
+  const x = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote, minLedger: p.loanSetLedger ?? -1 });
   const st = S.saleSteps({ ...x, now: 0 });
   if (!st.leftoverFixed || !x.fixedAt) { say("leftover not fixed yet: the loan is neither defaulted nor closed; nothing to distribute"); return { done: false }; }
   say(`leftover ${st.leftover.toFixed(6)} = proceeds ${st.proceeds.toFixed(6)} − LoanPay ${st.paid.toFixed(6)}; snapshot at ledger ${x.fixedAt.ledger} (${x.fixedAt.by} ${x.fixedAt.hash})`);
@@ -284,27 +366,28 @@ async function distributeOnce(ctx, secrets, c) {
   const pendingB = state.log.filter((e) => e.type === "Batch" && e.pending && /^leftover/.test(e.label));
   if (pendingB.length && !DRY) { const v = (await c.request({ command: "ledger", ledger_index: "validated" })).result.ledger_index;
     if (pendingB.some((e) => v <= e.lastLedgerSequence)) { say("an earlier leftover Batch may still validate; waiting before paying again"); return { done: false }; } pendingB.forEach((e) => (e.pending = false)); save(); }
-  const payTx = (r) => ({ TransactionType: "Payment", Destination: r.account, Amount: { ...quote, value: P.value(r.owed) }, Memos: [L.leftoverMemo(p.LoanID)] });
+  const payTx = (r) => asBroker({ TransactionType: "Payment", Destination: r.account, Amount: { ...quote, value: P.value(r.owed) }, Memos: [L.leftoverMemo(p.LoanID)] }, brokerAcct, payer?.address);
   for (const grp of S.leftoverChunks(due.map((r) => r.account), B.MAX_INNER)) {
     if (DRY) { for (const a of grp) { const r = due.find((x) => x.account === a); say(`[dry-run] would pay ${r.owed} to ${a} (${r.pct}% of the shares):`, JSON.stringify(payTx(r))); } continue; }
-    const now2 = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote });
+    const now2 = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote, minLedger: p.loanSetLedger ?? -1 });
     const fresh = S.leftoverStatus(split, { paid: now2.leftoverPays, lines, self: brokerAcct }).rows.filter((r) => grp.includes(r.account) && r.owed > 0 && r.status === "owed");
     for (const a of grp) if (!fresh.some((r) => r.account === a)) say(`lender ${a}: already paid on the ledger (memo duckbank/leftover); skipped`);
     if (!fresh.length) continue;
-    if (fresh.length === 1) { const r = fresh[0]; const res = await submit(c, secrets.wallet, payTx(r), state, `leftover ${r.owed} to ${r.account} (${r.pct}% of the shares)`, save); if (res.code !== "tesSUCCESS") say(`payment to ${r.account} failed ${res.code}: the amount stays recorded as owed`); continue; }
-    const res = await B.submitBatch(c, secrets.wallet, { mode: "INDEPENDENT", items: fresh.map((r) => ({ tx: payTx(r) })), record: (e) => { if (!state.log.includes(e)) state.log.push(e); save(); },
+    if (fresh.length === 1) { const r = fresh[0]; const res = await submit(c, payer, payTx(r), state, `leftover ${r.owed} to ${r.account} (${r.pct}% of the shares)`, save); if (res.code !== "tesSUCCESS") say(`payment to ${r.account} failed ${res.code}: the amount stays recorded as owed`); continue; }
+    const bseq = payer.address === brokerAcct ? null : (await c.request({ command: "account_info", account: brokerAcct, ledger_index: "current" })).result.account_data.Sequence;
+    const res = await B.submitBatch(c, payer, { mode: "INDEPENDENT", items: fresh.map((r, i) => (bseq == null ? { tx: payTx(r) } : { tx: payTx(r), account: brokerAcct, sequence: bseq + i })), record: (e) => { if (!state.log.includes(e)) state.log.push(e); save(); },
       label: `leftover Batch INDEPENDENT: ${fresh.map((r) => `${r.owed} to ${r.account}`).join(", ")}` });
     say(`${res.check.ok ? "OK" : "!!"} leftover Batch ${res.hash}: outer ${res.result}; ${res.check.rows.map((x, i) => `${fresh[i].account} ${fresh[i].owed} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
     for (const [i, x] of res.check.rows.entries()) if (!x.ok) say(`payment to ${fresh[i].account} failed (${x.problem}): the amount stays recorded as owed`);
   }
   for (const r of status.rows.filter((r) => r.status === "owed: no trust line")) say(`owed ${r.owed} to ${r.account}: no trust line for the vault asset, so it stays recorded as owed`);
-  if (!DRY) { const y = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote }); status = S.leftoverStatus(split, { paid: y.leftoverPays, lines, self: brokerAcct }); }
+  if (!DRY) { const y = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote, minLedger: p.loanSetLedger ?? -1 }); status = S.leftoverStatus(split, { paid: y.leftoverPays, lines, self: brokerAcct }); }
   state.leftover = { split: { ...split, payouts: split.payouts }, snapshot: { source: snap.source, at: x.fixedAt }, rows: status.rows }; save();
   for (const r of status.rows) say(`lender ${r.account}: ${r.amount} → ${r.status}${r.hashes.length ? " " + r.hashes.join(" ") : ""}`);
   return { done: true };
 }
 async function distribute() {
-  const ctx = loadPool(), secrets = loadSecrets(!DRY), c = await connect(ctx.p.network);
+  const ctx = loadPool(), secrets = loadSecrets("payer", !DRY), c = await connect(ctx.p.network);
   try { await distributeOnce(ctx, secrets, c); } finally { await c.disconnect(); }
 }
 function condition() {
@@ -315,6 +398,6 @@ function condition() {
   console.log(condition);
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const f = { condition, status, run, distribute }[cmd]; if (!f) die("usage: condition --out <file> | status --pool <file> | run --pool <file> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>] | distribute --pool <file> [--dry-run] [--secrets <file>]");
+  const f = { condition, status, run, distribute, manage, grant }[cmd]; if (!f) die("usage: condition --out <file> | status --pool <file> | grant --pool <file> --hot <address> --broker-secrets <file> | manage --pool <file> --action impair|default --broker-secrets <file> | run --pool <file> [--dry-run] [--secrets <hot file>] [--payer-secrets <file>] [--loanpay-blob <file>] [--watch <s>] | distribute --pool <file> [--dry-run] [--payer-secrets <file>]");
   Promise.resolve(f()).catch((e) => die(e?.data?.error || e.message));
 }

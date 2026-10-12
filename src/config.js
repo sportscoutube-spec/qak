@@ -26,8 +26,9 @@ export const AMENDMENTS = {
   required: ["SingleAssetVault", "LendingProtocol", "LendingProtocolV1_1"],
   info: ["fixCleanup3_4_0", "BatchV1_1", "PermissionDelegationV1_1"],
   // Shown for information only, never a gate. BatchV1_1: the devnet bot's atomic sell leg and leftover payouts. PermissionDelegationV1_1:
-  // not used (Loan*/Vault* are not delegable, and a delegated Payment could not be limited to an amount, currency or destination).
-  infoNote: { fixCleanup3_4_0: "info: impairment timing", BatchV1_1: "info only, not a gate: XLS-56 Batch, used by the devnet bot for the sell leg", PermissionDelegationV1_1: "info only, not a gate: XLS-75, deliberately not used" },
+  // the broker grants its hot bot account OfferCreate only (Loan*/Vault* are not delegable; a delegated Payment cannot be limited to an
+  // amount, currency or destination, so Payment is never granted).
+  infoNote: { fixCleanup3_4_0: "info: impairment timing", BatchV1_1: "info only, not a gate: XLS-56 Batch, used by the devnet bot for the sell leg", PermissionDelegationV1_1: "info only, not a gate: XLS-75, the broker grants the hot bot account OfferCreate only (no Payment, no Vault*/Loan*)" },
   ids: {
     SingleAssetVault: "81BD2619B6B3C8625AC5D0BC01DE17F06C3F0AB95C7C87C93715B87A4FD240D8",
     LendingProtocol: "565B90CA1AB2B9D42208ED10884188C64F9E19083DECB9634AAF06EB03299509",
@@ -59,6 +60,9 @@ export const NETWORKS = {
     asset: { label: "DUSD devnet test token (not RLUSD)", unit: "DUSD (devnet test token)", currency: DEVNET_TEST_CURRENCY, issuer: env.VITE_DEVNET_TEST_ISSUER || "", test: true,
       placeholder: "DEVNET_TEST_ISSUER_PLACEHOLDER (set VITE_DEVNET_TEST_ISSUER)" } },
 };
+// Frozen (deep): the mainnet hard-off cannot be flipped at runtime by page script, URL, localStorage or env.
+const deepFreeze = (o) => { for (const v of Object.values(o)) if (v && typeof v === "object") deepFreeze(v); return Object.freeze(o); };
+deepFreeze(NETWORKS);
 export const LEDGER_RPC = NETWORKS.mainnet.rpc; // QAK reads are mainnet, read-only
 
 // QAK token on XRPL mainnet. Issuer status (flags, blackhole, escrows) is read live; never hardcoded.

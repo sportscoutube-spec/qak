@@ -460,23 +460,30 @@ export function apply(s, f) {
 
 // Votes: one QAK = one vote, on the listing and the cap only (app rule, off-ledger).
 const pool = (s, id) => { const p = s.pools.find((x) => x.id === id); req(p, "no pool"); return p; };
-export function vote(s, id, yes, qak, who) {
+// One account, one vote, weighted by that account's QAK. `held` = its QAK balance read from the ledger: when given, the weight must
+// equal it (no claiming more than you hold). A second vote from the same account is refused.
+export function vote(s, id, yes, qak, who, held = null) {
   reqAccount(who); const p = pool(s, id); req(p.stage === "applied", "voting only while applied"); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000");
+  if (held !== null) req(qak === Math.floor(Number(held)), "QAK weight must equal the account's QAK balance on the ledger");
+  req(!p.voters.some((v) => v.who === who && !v.cap), "this account has already voted on this listing");
   p.votes[yes ? "yes" : "no"] += qak; p.voters.push({ who, yes: !!yes, qak });
   if (p.votes.yes >= R.LIST_VOTE_THRESHOLD_QAK && p.votes.yes > p.votes.no) {
     const best = Object.entries(p.capVotes).sort((a, b) => b[1] - a[1])[0]; if (best && best[1] > p.votes.yes) p.capRlusd = Number(best[0]);
     p.stage = "listed"; p.log.push(`listed by QAK vote; cap ${p.capRlusd} RLUSD`); }
   return p;
 }
-export function voteCap(s, id, cap, qak, who) {
+export function voteCap(s, id, cap, qak, who, held = null) {
   reqAccount(who); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000"); const p = pool(s, id); req(p.stage === "applied", "cap votes only while applied");
+  if (held !== null) req(qak === Math.floor(Number(held)), "QAK weight must equal the account's QAK balance on the ledger");
+  req(!p.voters.some((v) => v.who === who && v.cap), "this account has already voted on the cap");
   const maxCap = p.path === PATHS.cover ? NO_XRP.MAX_CAP_RLUSD : R.MAX_CAP_RLUSD;
-  cap = Number(cap); req(Number.isInteger(cap) && cap > 0 && cap <= maxCap, `cap vote must be 1..${maxCap}`); p.capVotes[cap] = (p.capVotes[cap] || 0) + qak; return p;
+  cap = Number(cap); req(Number.isInteger(cap) && cap > 0 && cap <= maxCap, `cap vote must be 1..${maxCap}`); p.capVotes[cap] = (p.capVotes[cap] || 0) + qak; p.voters.push({ who, cap, qak }); return p;
 }
 // Queue: locked QAK orders the Duck Bank deposit queue (app rule). The vault itself is public: the ledger accepts any VaultDeposit during Subscription.
 export function enqueue(s, who, id, amt, qakLocked) {
-  reqAccount(who); pool(s, id); amt = Number(amt); req(amt > 0, "bad amount");
-  s.queue.push({ who, id, amt, qakLocked: Number(qakLocked) || 0 }); s.queue.sort((a, b) => b.qakLocked - a.qakLocked); return s.queue;
+  reqAccount(who); const p = pool(s, id); amt = Number(amt); req(Number.isFinite(amt) && amt > 0 && amt <= p.capRlusd, `amount must be a finite number > 0 and at most the cap (${p.capRlusd})`);
+  const lock = qakLocked == null || qakLocked === "" ? 0 : Number(qakLocked); req(lock === 0 || isQak(lock), "QAK lock must be 0 or a whole number 1..1,000,000,000");
+  s.queue.push({ who, id, amt, qakLocked: lock }); s.queue.sort((a, b) => b.qakLocked - a.qakLocked); return s.queue;
 }
 // Record ledger ids after a validated transaction. One shop per vault: a pool's VaultID, LoanBrokerID and LoanID are set once.
 export function recordLedger(s, id, field, value) {
@@ -522,6 +529,6 @@ export function sanitizeState(raw) {
   const pools = raw.pools.filter(okPool).map((p) => ({ ...p, holdingVerified: false, voters: Array.isArray(p.voters) ? p.voters.filter((v) => v && okStr(v.who, 64)) : [] }));
   const ids = new Set(), vaults = new Set();
   const uniq = pools.filter((p) => { if (ids.has(p.id)) return false; if (p.ledger.VaultID && vaults.has(p.ledger.VaultID)) return false; ids.add(p.id); if (p.ledger.VaultID) vaults.add(p.ledger.VaultID); return true; });
-  const queue = Array.isArray(raw.queue) ? raw.queue.filter((q) => q && okStr(q.who, 64) && okStr(q.id, 64) && okNum(q.amt) && okNum(q.qakLocked)) : [];
+  const queue = Array.isArray(raw.queue) ? raw.queue.filter((q) => q && okStr(q.who, 64) && okStr(q.id, 64) && okNum(q.amt) && q.amt > 0 && okNum(q.qakLocked) && q.qakLocked >= 0 && q.qakLocked <= R.TOTAL_SUPPLY_QAK) : [];
   return { pools: uniq, queue };
 }
