@@ -60,6 +60,7 @@ async function leftoverRead(net, VaultID, x, quote, broker) {
   for (const r of split.payouts) lines[r.account] = await L.hasLine(net, r.account, quote).catch(() => null);
   return { st, snap, split, status: S.leftoverStatus(split, { paid: x.leftoverPays || [], lines, self: broker }) };
 }
+const BATCH_NOTE = "Sell leg: the bot sends EscrowFinish for every escrow, the OfferCreate (fill-or-kill, limit 3% below the quote) and the Payment of the shop's LoanPay amount as one XLS-56 Batch in ALLORNOTHING mode (amendment BatchV1_1): all of them apply or none do, and the bot checks each inner result by hash on the validated ledger. LoanManage and the shop's presigned LoanPay stay separate transactions: Loan* transactions cannot be Batch inner transactions and cannot be delegated (XLS-56, XLS-75). Leftover payouts go out in Batches of up to 8 Payments (INDEPENDENT mode).";
 const LEFT_RULE = "App rule the broker promises, separate from the vault and the loan, and not enforced by the ledger: sale proceeds that could not go into the loan by LoanPay (less than one installment, or anything still with the broker once the loan is defaulted or closed) are paid by the broker in the vault asset straight to that pool's lenders, pro rata to their vault MPT shares at the default (or at the LoanPay that closed the loan). Amounts are floored to 0.000001; the rounding remainder goes to the largest holder. A lender with no trust line for the asset cannot receive; that amount stays recorded as owed.";
 function leftoverHtml(lo, net) {
   if (!lo) return "";
@@ -67,7 +68,7 @@ function leftoverHtml(lo, net) {
   if (lo.err) return `<p class="warn">Leftover to lenders: read failed (${esc(lo.err)})</p>`;
   if (lo.pending) return `<p class="note"><b>Leftover to lenders:</b> not fixed yet (the loan is neither defaulted nor closed).</p>`;
   if (!lo.split) return `<p class="note"><b>Leftover to lenders:</b> none.</p>`;
-  const rows = lo.status.rows.map((r) => `<tr><td><code>${esc(r.account)}</code></td><td>${esc(r.pct)}%</td><td>${esc(r.amount.toFixed(6))}</td><td class="${r.status === "paid" ? "on" : r.status.startsWith("kept") ? "muted" : "warn"}">${esc(r.status)}${r.owed > 0 ? ` (${esc(r.owed.toFixed(6))} owed)` : ""}</td><td>${r.hashes.map(tx).join(" ")}</td></tr>`).join("");
+  const rows = lo.status.rows.map((r) => `<tr><td><code>${esc(r.account)}</code></td><td>${esc(r.pct)}%</td><td>${esc(r.amount.toFixed(6))}</td><td class="${r.status === "paid" ? "on" : r.status.startsWith("kept") ? "muted" : "warn"}">${esc(r.status)}${r.owed > 0 ? ` (${esc(r.owed.toFixed(6))} owed)` : ""}</td><td>${r.hashes.map(tx).join(" ")}${(r.batches || []).length ? ` <span class="note">in Batch ${r.batches.map(tx).join(" ")}</span>` : ""}</td></tr>`).join("");
   return `<h4>Leftover to lenders (after step 4)</h4><p class="note">${esc(lo.split.total.toFixed(6))} split over the vault MPT share holders at ledger ${esc(lo.snap.at.ledger)} (${esc(lo.snap.at.by)}), read from ${esc(lo.snap.source)}. Dust ${esc(lo.split.dust.toFixed(6))} to ${esc(lo.split.dustTo || "n/a")}.</p>
    <table><tr><th>Lender</th><th>Shares</th><th>Amount</th><th>Status</th><th>Payment</th></tr>${rows || '<tr><td colspan="5">no share holders at the snapshot: the amount stays recorded with the broker</td></tr>'}</table><p class="note">${esc(LEFT_RULE)}</p>`;
 }
@@ -243,7 +244,9 @@ function escrowCard(p) {
 function saleStepsHtml(st) {
   const tx = (net, h) => `<a href="https://${net === "devnet" ? "devnet" : "livenet"}.xrpl.org/transactions/${esc(h)}" target="_blank" rel="noopener noreferrer"><code>${esc(h.slice(0, 10))}…</code></a>`;
   const cls = { done: "on", stuck: "off", waiting: "warn", "not started": "muted" };
-  return (net) => `<ol class="steps">${st.steps.map((x) => `<li><b>${esc(x.name)}</b>: <span class="${cls[x.status]}">${esc(x.status)}</span>. ${esc(x.detail)} ${x.txs.map((h) => tx(net, h)).join(" ")}</li>`).join("")}</ol>
+  const bt = (net, b) => ` <span class="note">Batch ${tx(net, b.outer)} (inner: ${[...b.finishes, ...b.sales, ...b.shopPays].map((h) => tx(net, h)).join(" ")})</span>`;
+  return (net) => `<ol class="steps">${st.steps.map((x) => `<li><b>${esc(x.name)}</b>: <span class="${cls[x.status]}">${esc(x.status)}</span>. ${esc(x.detail)} ${x.txs.map((h) => tx(net, h)).join(" ")}${(x.batches || []).map((b) => bt(net, b)).join("")}</li>`).join("")}</ol>
+   <p class="note">${esc(BATCH_NOTE)}</p>
    <p class="note">Proceeds ${m2(st.proceeds)} · paid by LoanPay ${m2(st.paid)} · leftover for the lenders ${m2(st.leftover)}${st.shortfall != null ? ` · written down on the vault at default ${m2(st.shortfall)}` : ""}</p>`;
 }
 function saleCard(p) {
@@ -261,13 +264,13 @@ function devnetRunCard() { const R = DEVNET_TEST_RUN; if (!R) return "";
   const acct = (a) => `<a href="${esc(R.explorer)}/accounts/${esc(a)}" target="_blank" rel="noopener noreferrer"><code>${esc(a)}</code></a>`;
   const block = (run) => `<h4>${esc(run.title)}</h4><table><tr><td>VaultID</td><td><code>${esc(run.VaultID)}</code></td></tr><tr><td>LoanBrokerID</td><td><code>${esc(run.LoanBrokerID)}</code></td></tr><tr><td>LoanID</td><td><code>${esc(run.LoanID)}</code></td></tr></table>
     <table><tr><th>Step</th><th>Result</th><th>Tx</th></tr>${run.steps.map((x) => `<tr><td>${esc(x.step)}</td><td class="${x.ok ? "on" : "off"}">${esc(x.result)}</td><td>${tx(x.hash)}</td></tr>`).join("")}</table><p class="note">${esc(run.summary)}</p>`;
-  const live = R.runs.find((r) => r.sale);
+  const lives = R.runs.filter((r) => r.sale);
   return `<div class="card"><h3>Devnet test run</h3><p>${esc(R.when)}. Asset: ${esc(R.assetLabel)}, issuer ${acct(R.issuer)}. Devnet only; devnet may reset without warning. ${esc(R.note)}</p>${R.runs.map(block).join("")}
-   ${live ? `<p><button id="rederive" class="sec">Re-derive the four sale steps of ${esc(live.title.split(":")[0])} from devnet now</button></p><div id="rederived">${LG.live ? LG.live : ""}</div>` : ""}</div>`; }
-async function rederive() { const r = DEVNET_TEST_RUN.runs.find((x) => x.sale); if (!r) return; LG.live = '<p class="muted">reading devnet…</p>'; soft(["status"]);
+   ${lives.map((live) => `<p><button class="sec rederive" data-run="${esc(live.title.split(":")[0])}">Re-derive the four sale steps of ${esc(live.title.split(":")[0])} from devnet now</button></p>`).join("")}<div id="rederived">${LG.live ? LG.live : ""}</div></div>`; }
+async function rederive(ev) { const name = ev?.currentTarget?.dataset?.run; const r = DEVNET_TEST_RUN.runs.find((x) => x.sale && (!name || x.title.split(":")[0] === name)); if (!r) return; LG.live = '<p class="muted">reading devnet…</p>'; soft(["status"]);
   try { const x = await L.saleInputs("devnet", { LoanID: r.LoanID, broker: r.sale.broker, shop: r.sale.shop, escrows: r.sale.escrows, quote: r.sale.quote });
     let lo; try { lo = await leftoverRead("devnet", r.VaultID, x, r.sale.quote, r.sale.broker); } catch (e) { lo = { err: e.message || "unavailable" }; }
-    LG.live = saleStepsHtml(S.saleSteps({ ...x, now: S.nowRipple(), overdue: false }))("devnet") + leftoverHtml(lo, "devnet") + `<p class="note">Read from devnet at ${esc(athens(new Date()))}: Loan entry ${x.loan ? "present" : "gone"}, ${x.escrows.length} escrow(s), ${x.sales.length} sale(s), ${x.pays.length} LoanPay(s), ${(x.leftoverPays || []).length} leftover payment(s).</p>`; }
+    LG.live = `<h4>${esc(r.title.split(":")[0])}, read live</h4>` + saleStepsHtml(S.saleSteps({ ...x, now: S.nowRipple(), overdue: false }))("devnet") + leftoverHtml(lo, "devnet") + `<p class="note">Read from devnet at ${esc(athens(new Date()))}: Loan entry ${x.loan ? "present" : "gone"}, ${x.escrows.length} escrow(s), ${x.sales.length} sale(s), ${x.pays.length} LoanPay(s), ${(x.leftoverPays || []).length} leftover payment(s).</p>`; }
   catch (e) { LG.live = `<p class="warn">devnet read failed: ${esc(e.message || e)}</p>`; } soft(["status"]); }
 const pages = {
   "": () => { const pl = firstPlan(); return `<section class="hero"><div class="hero-text">
@@ -376,12 +379,13 @@ const pages = {
    <h2>Team</h2><div class="grid">${TEAM.map((t) => `<div class="card"><h3>${esc(t.name)}</h3>${esc(t.role)}</div>`).join("")}</div>
    <h2>Roadmap</h2><table class="card"><tr><th>When</th><th>Step</th><th>What</th></tr>${ROADMAP.map((r) => `<tr><td>${esc(r.when)}</td><td>${esc(r.step)}</td><td>${esc(r.what)}</td></tr>`).join("")}</table>`; },
   status: () => { const nets = Object.keys(NETWORKS), all = [...AMENDMENTS.required, ...AMENDMENTS.info];
-   const cell = (net, a) => { const f = FEAT[net]; if (f.loading) return `<td>checking…</td>`; if (f.err) return `<td class="warn">unavailable</td>`; if (!f.data) return `<td class="muted">snapshot: ${AMENDMENTS.snapshot[net][a] ? "enabled" : "not enabled"}</td>`; return f.data[a] ? `<td class="on">enabled</td>` : `<td class="off">not enabled</td>`; };
+   const cell = (net, a) => { const f = FEAT[net]; if (f.loading) return `<td>checking…</td>`; if (f.err) return `<td class="warn">unavailable</td>`; if (!f.data) return AMENDMENTS.snapshot[net][a] === undefined ? `<td class="muted">live check only</td>` : `<td class="muted">snapshot: ${AMENDMENTS.snapshot[net][a] ? "enabled" : "not enabled"}</td>`; return f.data[a] ? `<td class="on">enabled</td>` : `<td class="off">not enabled</td>`; };
    return `<h1>Amendment status</h1>
    <p>Live check: the read-only <code>feature</code> RPC on each network (no arguments, so nothing is voted or changed). Deposits and LoanSet stay disabled on a network until <b>all three</b> of SingleAssetVault, LendingProtocol and LendingProtocolV1_1 are enabled there. A rippled release is not activation: a server can support an amendment long before validators enable it, and only "enabled" counts.</p>
+   <p class="note">The BatchV1_1 and PermissionDelegationV1_1 rows are informational and gate nothing: the gate stays the three lending amendments, and mainnet stays off in this build whatever these rows say. Duck Bank uses Batch only in the devnet bot (sell leg, leftover payouts) and does not use Permission Delegation.</p>
    <p><button id="recheck">Re-check all networks now</button> <span class="muted">Re-checked automatically every ${n(RECHECK_MS / 60000)} minutes while this page is open.</span></p>
    <table><tr><th>Amendment</th>${nets.map((k) => `<th>${esc(NETWORKS[k].label)}<br><span class="muted">${esc(NETWORKS[k].rpc)}</span></th>`).join("")}</tr>
-   ${all.map((a) => `<tr><td>${esc(a)}${AMENDMENTS.info.includes(a) ? " (info: impairment timing)" : ""}</td>${nets.map((k) => cell(k, a)).join("")}</tr>`).join("")}
+   ${all.map((a) => `<tr><td>${esc(a)}${AMENDMENTS.info.includes(a) ? ` (${esc(AMENDMENTS.infoNote[a])})` : ""}</td>${nets.map((k) => cell(k, a)).join("")}</tr>`).join("")}
    <tr><td>Checked</td>${nets.map((k) => `<td>${FEAT[k].at ? esc(athens(FEAT[k].at)) : `snapshot ${esc(AMENDMENTS.snapshot.checked)}`}${FEAT[k].err ? `<br><span class="warn">${esc(FEAT[k].err)}</span>` : ""}</td>`).join("")}</tr>
    <tr><td>Vault lending in this app</td>${nets.map((k) => { const g = gateFor(k); return `<td class="${g.ok ? "on" : "off"}">${g.ok ? "allowed" : "disabled: " + esc(g.reasons.join(" "))}</td>`; }).join("")}</tr></table>
    <div class="card"><h3>Network config</h3><table><tr><th>Network</th><th>Feature flag</th><th>Lent asset</th><th>Issuer</th></tr>${nets.map((k) => { const x = NETWORKS[k]; return `<tr><td>${esc(x.label)}</td><td>${x.vaultLending ? "on when all three amendments are enabled" : `off (${esc(x.offReason)})`}</td><td>${esc(x.asset.label)}</td><td>${x.asset.issuer ? esc(x.asset.issuer) : `<span class="warn">${esc(x.asset.placeholder || "not set")}</span>`}</td></tr>`; }).join("")}</table>
@@ -429,7 +433,7 @@ function route() {
   document.getElementById("recheck")?.addEventListener("click", checkAll);
   if (pg === "qak" || pg === "status") { loadIssuer(false); document.getElementById("reissuer")?.addEventListener("click", () => loadIssuer(true)); }
   document.querySelectorAll("button[data-act]").forEach((btn) => btn.addEventListener("click", () => { const a = window.__acts?.[Number(btn.dataset.act)]; if (a && window.__pool) runAction(window.__pool, a); }));
-  document.getElementById("rederive")?.addEventListener("click", rederive);
+  document.querySelectorAll(".rederive").forEach((b) => b.addEventListener("click", rederive));
   const p0 = window.__pool, ee = () => document.getElementById("escerr");
   const onf = (id, fn) => { const fm = document.getElementById(id); if (fm && p0) fm.onsubmit = (e) => { e.preventDefault(); try { fn(new FormData(fm)); } catch (x) { ee().textContent = x.message; } }; };
   if (pg === "pool") {

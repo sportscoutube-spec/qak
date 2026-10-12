@@ -26,11 +26,13 @@ await assert.rejects(()=>L.issuerStatus(mock({...base,account_info:{status:"erro
 
 // featureStatus: read-only `feature` RPC per network, matched by name, ID fallback
 { const urls=[]; const feats={ "AAA":{name:"SingleAssetVault",enabled:true,supported:true}, "BBB":{name:"LendingProtocol",enabled:true,supported:true},
-    [AMENDMENTS.ids.LendingProtocolV1_1]:{enabled:false,supported:true}, "CCC":{name:"fixCleanup3_4_0",enabled:true} };
+    [AMENDMENTS.ids.LendingProtocolV1_1]:{enabled:false,supported:true}, "CCC":{name:"fixCleanup3_4_0",enabled:true}, [AMENDMENTS.ids.BatchV1_1]:{enabled:true}, "DDD":{name:"PermissionDelegationV1_1",enabled:true} };
   const f=async(url,opt)=>{ urls.push(url); const b=JSON.parse(opt.body); assert.equal(b.method,"feature"); assert.deepEqual(b.params,[{}],"no vote arguments"); return {ok:true,json:async()=>({result:{status:"success",features:feats}})}; };
-  const d=await L.featureStatus("devnet",f); assert.deepEqual(d,{SingleAssetVault:true,LendingProtocol:true,LendingProtocolV1_1:false,fixCleanup3_4_0:true});
+  const d=await L.featureStatus("devnet",f); assert.deepEqual(d,{SingleAssetVault:true,LendingProtocol:true,LendingProtocolV1_1:false,fixCleanup3_4_0:true,BatchV1_1:true,PermissionDelegationV1_1:true});
+  // Batch/Delegation rows are info only: with them enabled and LendingProtocolV1_1 off, the devnet gate stays closed.
+  assert(!AMENDMENTS.required.includes("BatchV1_1") && !AMENDMENTS.required.includes("PermissionDelegationV1_1"));
   await L.featureStatus("mainnet",f); await L.featureStatus("testnet",f); assert.deepEqual(urls,[NETWORKS.devnet.rpc,NETWORKS.mainnet.rpc,NETWORKS.testnet.rpc]);
-  assert.deepEqual(await L.featureStatus("devnet",mock({feature:{status:"success",features:{}}})),{SingleAssetVault:false,LendingProtocol:false,LendingProtocolV1_1:false,fixCleanup3_4_0:false});
+  assert.deepEqual(await L.featureStatus("devnet",mock({feature:{status:"success",features:{}}})),{SingleAssetVault:false,LendingProtocol:false,LendingProtocolV1_1:false,fixCleanup3_4_0:false,BatchV1_1:false,PermissionDelegationV1_1:false});
   await assert.rejects(()=>L.featureStatus("nope",f),/unknown network/); ok("featureStatus: per network, by name or ID, missing = not enabled"); }
 
 // ledgerEntry / createdId

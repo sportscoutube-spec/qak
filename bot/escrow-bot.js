@@ -7,12 +7,15 @@
 //   node bot/escrow-bot.js status --pool <pool.json>
 //        read-only: escrows, live ratio, add/default lines, window state and the four sale steps
 //   node bot/escrow-bot.js run --pool <pool.json> [--dry-run] [--secrets <file>] [--loanpay-blob <file>] [--watch <s>] [--max-minutes <m>]
-//        1 LoanManage tfLoanImpair once a payment is overdue  2 EscrowFinish every escrow  3 OfferCreate (IOC + sell) XRP for the vault asset
-//        4 fund and submit the shop's own signed LoanPay (XLS-66: only Loan.Borrower may LoanPay)  then LoanManage tfLoanDefault for the rest
+//        1 LoanManage tfLoanImpair once a payment is overdue (its own tx: Loan* cannot be a Batch inner tx)
+//        2+3 one XLS-56 Batch, ALLORNOTHING: EscrowFinish every escrow + OfferCreate (fill-or-kill + sell, limit = quote − 3%) + Payment of the
+//            shop's presigned LoanPay amount to the shop when that amount is covered by the guaranteed minimum output (all or none apply)
+//        4 submit the shop's own presigned LoanPay (XLS-66: only Loan.Borrower may LoanPay)  then LoanManage tfLoanDefault for the rest
 //        then, once the loan is defaulted or closed, `distribute` (below)
 //   node bot/escrow-bot.js distribute --pool <pool.json> [--dry-run] [--secrets <file>]
 //        leftover proceeds (not put into the loan by LoanPay) to the pool's lenders, pro rata to their vault MPT shares at the default
-//        (or at the LoanPay that closed the loan): a Payment in the vault asset from the broker wallet to each lender. App rule.
+//        (or at the LoanPay that closed the loan): a Payment in the vault asset from the broker wallet to each lender, sent in XLS-56
+//        Batches of up to 8 Payments (INDEPENDENT mode), skipping any lender already paid (memo duckbank/leftover + LoanID). App rule.
 //
 // Secrets: BROKER_SEED and ESCROW_FULFILLMENT from the environment, or --secrets <json outside the repo, mode 0600> with
 // {"brokerSeed": "...", "fulfillment": "..."}. Secrets are never printed or written anywhere else. Mainnet and testnet are refused.
@@ -25,6 +28,7 @@ import * as S from "../src/state.js";
 import * as P from "../src/payloads.js";
 import * as L from "../src/ledger.js";
 import { ESCROW, FLAGS, SPEC } from "../src/config.js";
+import * as B from "./batch.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const NETS = { devnet: { id: 2, ws: "wss://devnet.xrpl-labs.com/", rpc: "https://devnet.xrpl-labs.com/" } }; // mainnet/testnet: refused in this build
@@ -66,6 +70,12 @@ async function connect(net) {
   const c = new xrpl.Client(NETS[net].ws, { connectionTimeout: 30000, timeout: 60000 }); await c.connect();
   const nid = (await c.request({ command: "server_info" })).result.info.network_id;
   if (nid !== NETS[net].id) { await c.disconnect(); die(`server network_id ${nid} is not ${net}`); }
+  // JSON-RPC over HTTP for every request (public devnet websockets stall now and then), with a timeout and retries on network errors;
+  // ledger errors (status "error") pass through unchanged.
+  const RPC_URL = NETS[net].rpc; const orig = c.request.bind(c); c.request = async (r) => { const { command, ...rest } = r; let last;
+    for (let i = 0; i < 8; i++) { try { const res = await fetch(RPC_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ method: command, params: [{ api_version: 2, ...rest }] }), signal: AbortSignal.timeout(20000) });
+        const j = await res.json(); if (j.result?.status === "error" || j.result?.error) { const e = new Error(j.result.error_message || j.result.error); e.data = j.result; throw e; } return { result: j.result }; }
+      catch (e) { if (e.data) throw e; last = e; await new Promise((s) => setTimeout(s, 3000)); } } throw last; };
   return c;
 }
 const node = async (c, req) => { try { return (await c.request({ command: "ledger_entry", ...req, ledger_index: "validated" })).result.node; } catch (e) { if (/entryNotFound|objectNotFound/.test(e?.data?.error || e.message)) return null; throw e; } };
@@ -115,6 +125,33 @@ export function dueNow(loan, now) {
   return { late, due: ceil6(due) };
 }
 
+// Plan the atomic sell leg (pure, tested). rows: verified open escrows [{owner, seq, drops}]; unsoldDrops: XRP already finished but not sold.
+// Batch limit (XLS-56 §2.1.2): 2..8 inner txs. Slots: 1 OfferCreate, 1 Payment to the shop when included, the rest EscrowFinish. Escrows that
+// do not fit are finished first in their own txs/batches (`pre`), and their XRP is sold in the main Batch.
+// Payment amount: an ALLORNOTHING Batch can only carry fixed amounts, and the sale output is not known in advance. The OfferCreate is
+// fill-or-kill + sell, so it either sells all the XRP at or above the limit price (output >= TakerPays = minOut) or is killed, and the whole
+// Batch with it. The Payment therefore carries the shop's presigned LoanPay amount only when that amount <= minOut; any output above it stays
+// with the broker (it is leftover for the lenders, never sent to the shop). If minOut is below the LoanPay amount, the Batch carries no
+// Payment, and the Payment + LoanPay follow only if the actual output covers them (not atomic; logged).
+export function planSaleBatch({ rows, unsoldDrops = 0, quoteFor, quote, slippagePct, loanPayAmount = null, condition, fulfillment }) {
+  const maxFin = B.MAX_INNER - 1 - (loanPayAmount ? 1 : 0); const inBatch = rows.slice(0, maxFin), pre = rows.slice(maxFin);
+  const finish = (r) => P.escrowFinish({ Owner: r.owner, OfferSequence: r.seq, Condition: condition, Fulfillment: fulfillment });
+  const drops = unsoldDrops + rows.reduce((t, r) => t + r.drops, 0); if (!(drops > 0)) return { none: "no XRP to sell" };
+  const q = quoteFor(drops / S.DROPS); if (q.noMarket || !(q.best > 0)) return { none: "no market (no AMM, empty book)" };
+  const minOut = Math.floor(q.best * (1 - slippagePct / 100) * 1e6) / 1e6; if (!(minOut > 0)) return { none: "minimum output rounds to 0" };
+  const offer = P.offerSellXrp({ xrpDrops: drops, quote, minQuote: minOut, fillOrKill: true });
+  const pay = loanPayAmount && loanPayAmount <= minOut + 1e-9 ? loanPayAmount : null;
+  const items = [...inBatch.map((r) => ({ tx: finish(r), row: r })), { tx: offer }];
+  if (pay) items.push({ tx: { TransactionType: "Payment", Destination: null, Amount: { ...quote, value: P.value(pay) } }, shopPay: true });
+  return { pre: pre.map((r) => ({ tx: finish(r), row: r })), items, drops, quote: q.best, source: q.source, minOut, pay,
+    why: pay ? `Payment ${pay} (the presigned LoanPay amount) <= guaranteed minimum ${minOut}` : loanPayAmount ? `LoanPay amount ${loanPayAmount} above the guaranteed minimum ${minOut}: no Payment in the Batch` : "no presigned LoanPay yet: no Payment in the Batch" };
+}
+// Check the shop's presigned LoanPay blob against the Loan (does not check that proceeds cover it).
+export function checkLoanPayBlob(tx, { loan, LoanID, quote, due, late }) {
+  const amt = Number(tx.Amount?.value);
+  return tx.TransactionType !== "LoanPay" ? "not a LoanPay" : tx.Account !== loan.Borrower ? "not signed by Loan.Borrower" : tx.LoanID !== LoanID ? "wrong LoanID"
+    : tx.Amount?.currency !== quote.currency || tx.Amount?.issuer !== quote.issuer ? "wrong asset" : !(amt >= due) ? `amount ${amt} below the ${due} due` : late && !(Number(tx.Flags) & FLAGS.tfLoanLatePayment) ? "late payment without tfLoanLatePayment" : null;
+}
 async function once(c, ctx, secrets) {
   const { p, w, state, save } = ctx;
   const r = await readAll(c, p, w);
@@ -130,47 +167,62 @@ async function once(c, ctx, secrets) {
   if (!plan.sell && !state.saleStartedAt) return { done: false, why: plan.why };
   if (!state.saleStartedAt && !DRY) { state.saleStartedAt = r.now; save(); }
   const saleEnds = (state.saleStartedAt ?? r.now) + w.SALE_WINDOW_SECONDS;
-  // Step 2: finish every verified escrow still open.
+  // Steps 2+3 (+ the Payment to the shop): one ALLORNOTHING Batch.
   if (!DRY && !secrets.fulfillment) die("no fulfillment: set ESCROW_FULFILLMENT or pass --secrets");
   if (secrets.fulfillment && conditionFromFulfillment(secrets.fulfillment) !== p.condition.toUpperCase()) die("the fulfillment does not match the pool's Condition");
-  let openLeft = 0;
-  for (const row of r.set.rows) {
-    const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner);
-    if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); continue; }
-    const res = await act(`2 EscrowFinish ${row.owner}/${row.seq}`, P.escrowFinish({ Owner: row.owner, OfferSequence: row.seq, Condition: p.condition, Fulfillment: secrets.fulfillment || "A0228020" + "0".repeat(64) }));
-    if (res.code === "tesSUCCESS") { state.finishedDrops += row.drops; save(); } else openLeft++;
+  const ful = secrets.fulfillment || "A0228020" + "0".repeat(64);
+  const recordB = (e) => { if (!state.log.includes(e)) state.log.push(e); save(); };
+  let openLeft = 0; const rows = [];
+  for (const row of r.set.rows) { const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner); if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); openLeft++; continue; } rows.push(row); }
+  // The shop's presigned LoanPay (read now, so its amount can ride in the Batch).
+  const loan0 = await node(c, { index: p.LoanID }); let lp = null; const blobFile = opt("loanpay-blob");
+  if (loan0 && loan0.PaymentRemaining > 0 && !(loan0.Flags & FLAGS.lsfLoanDefault)) {
+    const { late, due } = dueNow(loan0, r.now);
+    if (blobFile && blobFile !== true && fs.existsSync(blobFile)) { const blob = fs.readFileSync(blobFile, "utf8").trim(), tx = xrpl.decode(blob), hash = xrpl.hashes.hashSignedTx(blob);
+      const bad = checkLoanPayBlob(tx, { loan: loan0, LoanID: p.LoanID, quote: r.quote, due, late });
+      if (bad) say(`4 LoanPay blob refused: ${bad}`); else if (!(state.loanPays || []).includes(hash)) lp = { blob, hash, amt: Number(tx.Amount.value), late, due }; }
+    else if (blobFile && rows.length && r.now < saleEnds - w.SALE_WINDOW_SECONDS / 2) return { done: false, why: `waiting for the shop's presigned LoanPay (at least ${due}) so its funding can ride in the Batch` };
   }
-  // Step 3: sell what the escrows delivered (never the broker's own XRP).
-  const toSell = state.finishedDrops - state.soldDrops;
-  if (toSell > 0) {
-    const q = S.sellQuote({ ...r.market, xrp: toSell / S.DROPS });
-    if (q.noMarket || !(q.best > 0)) say("3 sell: no market (no AMM, empty book); step stuck");
+  const unsold = state.finishedDrops - state.soldDrops;
+  if (rows.length || unsold > 0) {
+    const plan2 = planSaleBatch({ rows, unsoldDrops: unsold > 1000 ? unsold : 0, quoteFor: (xrp) => S.sellQuote({ ...r.market, xrp }), quote: r.quote, slippagePct: w.SELL_MAX_SLIPPAGE_PCT,
+      loanPayAmount: lp && !(state.funded || []).includes(lp.hash) ? lp.amt : null, condition: p.condition, fulfillment: ful });
+    if (plan2.none) { say(`2+3 sell: ${plan2.none}; step stuck`); openLeft += rows.length; }
     else {
-      const minQuote = q.best * (1 - w.SELL_MAX_SLIPPAGE_PCT / 100);
-      const res = await act(`3 OfferCreate sell ${toSell / S.DROPS} XRP (quote ${q.best.toFixed(6)} via ${q.source}, limit ${minQuote.toFixed(6)})`, P.offerSellXrp({ xrpDrops: toSell, quote: r.quote, minQuote }));
-      if (res.code === "tesSUCCESS") { const sold = -L.balanceDelta(res.meta, wallet.address, "XRP") - res.fee; const got = L.balanceDelta(res.meta, wallet.address, r.quote);
-        state.soldDrops += Math.min(toSell, Math.max(0, sold)); state.proceeds += got; save(); say(`sold ${sold / S.DROPS} XRP, received ${got} of the vault asset`); }
-    }
-  }
-  // Step 4: deliver with the shop's own signed LoanPay, funded by the broker right before submission.
-  const loan = await node(c, { index: p.LoanID }); const left = state.proceeds - state.delivered;
-  if (loan && loan.PaymentRemaining > 0 && !(loan.Flags & FLAGS.lsfLoanDefault) && left > 0) {
-    const { late, due } = dueNow(loan, r.now); const blobFile = opt("loanpay-blob");
-    if (left < due) say(`4 LoanPay: proceeds left ${left} are below one installment ${due}; LoanPay takes no partial payment, so this part is a shortfall`);
-    else if (!blobFile || blobFile === true || !fs.existsSync(blobFile)) say(`4 LoanPay: waiting for the shop's signed LoanPay of at least ${due}${late ? " with tfLoanLatePayment" : ""} (XLS-66: only Loan.Borrower may LoanPay)`);
-    else {
-      const blob = fs.readFileSync(blobFile, "utf8").trim(), tx = xrpl.decode(blob);
-      const amt = Number(tx.Amount?.value);
-      const bad = tx.TransactionType !== "LoanPay" ? "not a LoanPay" : tx.Account !== loan.Borrower ? "not signed by Loan.Borrower" : tx.LoanID !== p.LoanID ? "wrong LoanID"
-        : tx.Amount?.currency !== r.quote.currency || tx.Amount?.issuer !== r.quote.issuer ? "wrong asset" : !(amt >= due) ? `amount ${amt} below the ${due} due` : amt > left + 1e-9 ? `amount ${amt} above the proceeds left ${left}` : late && !(Number(tx.Flags) & FLAGS.tfLoanLatePayment) ? "late payment without tfLoanLatePayment" : null;
-      if (bad) say(`4 LoanPay blob refused: ${bad}`);
-      else if (DRY) say(`[dry-run] would send ${amt} to the shop and submit its signed LoanPay`);
+      for (const it of plan2.items) if (it.shopPay) it.tx.Destination = loan0.Borrower;
+      say(`2+3 plan: ${plan2.items.length} inner txs, sell ${plan2.drops / S.DROPS} XRP (quote ${plan2.quote.toFixed(6)} via ${plan2.source}, minimum ${plan2.minOut}); ${plan2.why}${plan2.pre.length ? `; ${plan2.pre.length} escrow(s) beyond the 8-tx limit are finished first` : ""}`);
+      if (DRY) say("[dry-run] would submit Batch ALLORNOTHING:", JSON.stringify(plan2.items.map((x) => x.tx)));
       else {
-        const pay = await submit(c, wallet, { TransactionType: "Payment", Destination: loan.Borrower, Amount: { ...r.quote, value: tx.Amount.value } }, state, `4a Payment ${amt} to the shop for its LoanPay`, save);
-        if (pay.code === "tesSUCCESS") { const lp = await submitBlob(c, blob, state, `4b LoanPay ${amt} (shop-signed${late ? ", tfLoanLatePayment" : ""})`, save); if (lp.code === "tesSUCCESS") { state.delivered += amt; save(); } }
+        // Escrows beyond the 8-tx limit: finish them first (INDEPENDENT batches of up to 8, or a single tx), then sell everything in the main Batch.
+        for (const grp of B.chunk(plan2.pre, B.MAX_INNER)) {
+          if (grp.length === 1) { const res = await submit(c, wallet, grp[0].tx, state, `2 EscrowFinish ${grp[0].row.owner}/${grp[0].row.seq} (beyond the Batch limit)`, save); if (res.code === "tesSUCCESS") { state.finishedDrops += grp[0].row.drops; save(); } continue; }
+          const res = await B.submitBatch(c, wallet, { mode: "INDEPENDENT", items: grp.map((x) => ({ tx: x.tx })), record: recordB, label: `2 Batch INDEPENDENT: EscrowFinish ×${grp.length} (beyond the main Batch's limit)` });
+          grp.forEach((x, i) => { if (res.inners[i].ok) state.finishedDrops += x.row.drops; }); save(); say(`${res.check.ok ? "OK" : "!!"} pre-finish Batch ${res.hash} ${res.check.problems.join("; ")}`);
+        }
+        const res = await B.submitBatch(c, wallet, { mode: "ALLORNOTHING", items: plan2.items.map((x) => ({ tx: x.tx })), record: recordB, label: `2+3 Batch ALLORNOTHING: EscrowFinish ×${plan2.items.filter((x) => x.row).length} + OfferCreate FoK (min ${plan2.minOut})${plan2.pay ? ` + Payment ${plan2.pay} to the shop` : ""}` });
+        say(`${res.check.ok ? "OK" : "!!"} 2+3 Batch ${res.hash}: outer ${res.result}; inner ${res.check.rows.map((x, i) => `${plan2.items[i].tx.TransactionType} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
+        if (res.check.problems.length) say("   batch problems:", res.check.problems.join("; "));
+        if (res.check.ok) {
+          plan2.items.forEach((x) => { if (x.row) state.finishedDrops += x.row.drops; });
+          const off = res.inners[plan2.items.findIndex((x) => x.tx.TransactionType === "OfferCreate")];
+          const sold = -L.balanceDelta(off.meta, wallet.address, "XRP"), got = L.balanceDelta(off.meta, wallet.address, r.quote);
+          state.soldDrops += Math.max(0, sold); state.proceeds += got;
+          if (plan2.pay) { (state.funded ||= []).push(lp.hash); state.shopFunded = (state.shopFunded || 0) + plan2.pay; }
+          save(); say(`sold ${sold / S.DROPS} XRP for ${got} (guaranteed minimum ${plan2.minOut})${plan2.pay ? `, paid ${plan2.pay} to the shop in the same Batch` : ""}`);
+        } else { openLeft += rows.length; say("the Batch applied nothing (ALLORNOTHING); it is retried on the next pass with a fresh quote"); }
       }
     }
   }
+  // Step 4: the shop's presigned LoanPay. If its funding was not in the Batch (amount above the guaranteed minimum), fund it now from the
+  // actual proceeds when they cover it (two separate txs, not atomic).
+  if (lp && !DRY) {
+    const left = state.proceeds - state.delivered; let funded = (state.funded || []).includes(lp.hash);
+    if (!funded && left + 1e-9 >= lp.amt) { const pay = await submit(c, wallet, { TransactionType: "Payment", Destination: loan0.Borrower, Amount: { ...r.quote, value: P.value(lp.amt) } }, state, `4a Payment ${lp.amt} to the shop (outside the Batch: amount above the guaranteed minimum)`, save);
+      if (pay.code === "tesSUCCESS") { (state.funded ||= []).push(lp.hash); funded = true; save(); } }
+    else if (!funded) say(`4 LoanPay: proceeds left ${left} are below the presigned ${lp.amt}; LoanPay takes no partial payment, so this part is a shortfall`);
+    if (funded) { const res = await submitBlob(c, lp.blob, state, `4 LoanPay ${lp.amt} (shop-presigned${lp.late ? ", tfLoanLatePayment" : ""})`, save);
+      (state.loanPays ||= []).push(lp.hash); if (res.code === "tesSUCCESS") state.delivered += lp.amt; save(); }
+  } else if (lp && DRY) say(`[dry-run] would submit the shop's presigned LoanPay ${lp.amt}`);
   // Default the rest when the ledger allows it and nothing more can be delivered (or the sale window is over).
   const l2 = await node(c, { index: p.LoanID });
   if (l2 && l2.PaymentRemaining > 0 && !(l2.Flags & FLAGS.lsfLoanDefault)) {
@@ -225,11 +277,25 @@ async function distributeOnce(ctx, secrets, c) {
   const due = status.rows.filter((r) => r.owed > 0 && r.status === "owed"), need = due.reduce((t, r) => t + r.owed, 0);
   const have = await L.iouBalance(p.network, brokerAcct, quote).catch(() => null);
   if (have != null && Number(have) + 1e-9 < need) { say(`broker holds ${have} of the vault asset, below the ${need.toFixed(6)} to pay; stopping`); return { done: false }; }
-  for (const r of due) {
-    const tx = { TransactionType: "Payment", Destination: r.account, Amount: { ...quote, value: String(+r.owed.toFixed(6)) }, Memos: [L.leftoverMemo(p.LoanID)] };
-    if (DRY) { say(`[dry-run] would pay ${r.owed} to ${r.account} (${r.pct}% of the shares):`, JSON.stringify(tx)); continue; }
-    const res = await submit(c, secrets.wallet, tx, state, `leftover ${r.owed} to ${r.account} (${r.pct}% of the shares)`, save);
-    if (res.code !== "tesSUCCESS") say(`payment to ${r.account} failed ${res.code}: the amount stays recorded as owed`);
+  // Leftover Payments in XLS-56 Batches of up to 8, INDEPENDENT mode: each lender's Payment stands alone, so one lender that cannot receive
+  // (frozen line, removed line) does not block the others; failures stay "owed" and are retried. Idempotent: before each chunk the bot
+  // re-reads the ledger for memo-tagged (duckbank/leftover + LoanID) Payments to each lender and pays only what is still owed; a Batch still
+  // pending from an earlier pass (not validated, LastLedgerSequence not passed) blocks a new one.
+  const pendingB = state.log.filter((e) => e.type === "Batch" && e.pending && /^leftover/.test(e.label));
+  if (pendingB.length && !DRY) { const v = (await c.request({ command: "ledger", ledger_index: "validated" })).result.ledger_index;
+    if (pendingB.some((e) => v <= e.lastLedgerSequence)) { say("an earlier leftover Batch may still validate; waiting before paying again"); return { done: false }; } pendingB.forEach((e) => (e.pending = false)); save(); }
+  const payTx = (r) => ({ TransactionType: "Payment", Destination: r.account, Amount: { ...quote, value: P.value(r.owed) }, Memos: [L.leftoverMemo(p.LoanID)] });
+  for (const grp of S.leftoverChunks(due.map((r) => r.account), B.MAX_INNER)) {
+    if (DRY) { for (const a of grp) { const r = due.find((x) => x.account === a); say(`[dry-run] would pay ${r.owed} to ${a} (${r.pct}% of the shares):`, JSON.stringify(payTx(r))); } continue; }
+    const now2 = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote });
+    const fresh = S.leftoverStatus(split, { paid: now2.leftoverPays, lines, self: brokerAcct }).rows.filter((r) => grp.includes(r.account) && r.owed > 0 && r.status === "owed");
+    for (const a of grp) if (!fresh.some((r) => r.account === a)) say(`lender ${a}: already paid on the ledger (memo duckbank/leftover); skipped`);
+    if (!fresh.length) continue;
+    if (fresh.length === 1) { const r = fresh[0]; const res = await submit(c, secrets.wallet, payTx(r), state, `leftover ${r.owed} to ${r.account} (${r.pct}% of the shares)`, save); if (res.code !== "tesSUCCESS") say(`payment to ${r.account} failed ${res.code}: the amount stays recorded as owed`); continue; }
+    const res = await B.submitBatch(c, secrets.wallet, { mode: "INDEPENDENT", items: fresh.map((r) => ({ tx: payTx(r) })), record: (e) => { if (!state.log.includes(e)) state.log.push(e); save(); },
+      label: `leftover Batch INDEPENDENT: ${fresh.map((r) => `${r.owed} to ${r.account}`).join(", ")}` });
+    say(`${res.check.ok ? "OK" : "!!"} leftover Batch ${res.hash}: outer ${res.result}; ${res.check.rows.map((x, i) => `${fresh[i].account} ${fresh[i].owed} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
+    for (const [i, x] of res.check.rows.entries()) if (!x.ok) say(`payment to ${fresh[i].account} failed (${x.problem}): the amount stays recorded as owed`);
   }
   for (const r of status.rows.filter((r) => r.status === "owed: no trust line")) say(`owed ${r.owed} to ${r.account}: no trust line for the vault asset, so it stays recorded as owed`);
   if (!DRY) { const y = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: brokerAcct, shop: p.shop, escrows: p.escrows, quote }); status = S.leftoverStatus(split, { paid: y.leftoverPays, lines, self: brokerAcct }); }

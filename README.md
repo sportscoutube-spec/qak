@@ -11,12 +11,14 @@ Live: https://trustline-tan.vercel.app · Whitepaper: `public/qak-whitepaper.pdf
 XLS-65/66 need **SingleAssetVault, LendingProtocol and LendingProtocolV1_1**. A rippled release is not activation: an
 amendment counts only once validators enable it. The Status page (`#/status`) runs the read-only `feature` RPC on each network.
 Snapshot 2026-10-08 09:13 EEST: mainnet and testnet have none enabled; devnet has all three.
+BatchV1_1 and PermissionDelegationV1_1 are shown on the Status page for information only. They are not gates: the gate stays the
+three lending amendments, and mainnet stays off.
 
 - **Mainnet:** hard-off in `src/config.js` (`NETWORKS.mainnet.vaultLending = false`). No env switch turns it on. No mainnet deposits.
 - **Testnet:** status only.
 - **Devnet:** may call the real transactions once all three amendments read enabled and a test issuer is configured.
   RLUSD does not exist on devnet, so the asset is DUSD, a labelled devnet test token (not RLUSD, no value; currency code fixed in `src/config.js`)
-  issued by `VITE_DEVNET_TEST_ISSUER`. Unset, devnet actions stay disabled. A completed end-to-end devnet run is listed on the Status page.
+  issued by `VITE_DEVNET_TEST_ISSUER`. Unset, devnet actions stay disabled. A completed end-to-end devnet run is listed on the Status page, plus Run D (12 Oct 2026): the batched sell leg and a batched leftover split to two lenders (3.939496 / 2.623704 DUSD).
 
 ## Run
 ```
@@ -84,8 +86,25 @@ the ledger does not enforce is an **app rule**.
 5. Under 150% the shop has the add window to add a second escrow or LoanPay the balance down. If the window ends under 120%,
    the bot runs.
 6. Four sale steps, each shown done/stuck from ledger reads: mark (`LoanManage` tfLoanImpair) → finish escrows (`EscrowFinish`)
-   → sell (`OfferCreate` tfImmediateOrCancel|tfSell) → the shop's signed `LoanPay`. Then `LoanManage` tfLoanDefault for the
+   → sell (`OfferCreate` tfFillOrKill|tfSell) → the shop's presigned `LoanPay`. Then `LoanManage` tfLoanDefault for the
    rest; any shortfall is written down on that vault.
+7. **The sell leg is atomic through XLS-56 Batch** (amendment BatchV1_1, `bot/batch.js`). Every EscrowFinish, the OfferCreate
+   and the Payment of the LoanPay amount to the shop are the inner transactions of one `Batch` in ALLORNOTHING mode: all of them
+   apply, or none do. The bot never trusts the outer `tesSUCCESS` (XLS-56 §6): it looks up every inner hash on the validated
+   ledger and checks its result, its `ParentBatchID` and its ledger. Both the outer hash and the inner hashes are recorded in the
+   bot state, and the pool page shows them. Limits: 2..8 inner transactions. Escrows beyond the limit are finished first, in
+   their own transactions or INDEPENDENT batches, and their XRP is sold in the main Batch.
+   - Amount: a Batch carries fixed amounts and the sale output is unknown in advance. The OfferCreate is fill-or-kill + sell with
+     TakerPays = quote − 3%, so it sells all the XRP for at least that, or it is killed and the whole Batch with it. The Payment to
+     the shop is included only when the presigned LoanPay amount ≤ that minimum. Output above it stays with the broker as
+     leftover for the lenders. Otherwise the Payment and the LoanPay follow the Batch separately, if the actual output covers them.
+   - **LoanPay stays presigned, and impair and default stay separate**, because Loan* (and Vault*) transactions can be neither
+     Batch inner transactions (`temINVALID_INNER_BATCH`) nor delegated (XLS-75; a DelegateSet granting LoanPay fails
+     `temMALFORMED`, devnet probe 2026-10-12).
+   - **Escrow + LoanSet atomicity waits on LendingProtocolV1_2**, a future amendment that would lift the inner-transaction ban on
+     Loan*. Until then LoanSet is gated on the escrows already being on the ledger.
+   - **Payment delegation is deliberately not used**: a delegated Payment cannot be limited to an amount, a currency or a
+     destination, so it would let the bot spend all of the shop's RLUSD.
 
 Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file kept off-ledger.
 
@@ -122,6 +141,10 @@ Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file k
   - Amounts floored to 0.000001; the rounding remainder goes to the largest holder (ties: lowest address).
   - No trust line for the asset: the Payment cannot deliver, so the amount stays recorded as owed and is shown.
   - Each Payment carries the memo `duckbank/leftover` + LoanID; the pool page lists amounts, hashes and anything owed.
+  - Sent in XLS-56 Batches of up to 8 Payments, INDEPENDENT mode, so one lender who cannot receive does not block the others
+    (that amount stays owed and is retried). Idempotent: before each Batch the bot re-reads the memo-tagged payments on the
+    ledger and pays only what is still owed. A leftover Batch that may still validate (LastLedgerSequence not passed) blocks a
+    new one. A lone remaining lender gets a plain Payment (a Batch needs at least 2 inner transactions).
 - **Impair needs an overdue payment.** A price breach while payments are current arms the bot, which then waits for the next due date.
 
 ### The bot (`bot/escrow-bot.js`, broker side, devnet only)

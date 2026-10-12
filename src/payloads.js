@@ -86,7 +86,9 @@ export function escrowFinish({ Owner, OfferSequence, Condition, Fulfillment }) {
 }
 // Sell XRP for the quote asset: OfferCreate with tfImmediateOrCancel + tfSell, so nothing rests on the book and all of TakerGets is sold
 // at or above the limit price; the payment engine fills from the order book, the AMM or both.
-export function offerSellXrp({ xrpDrops, quote, minQuote }) {
+// fillOrKill: tfFillOrKill + tfSell instead, for the bot's Batch: the whole TakerGets is sold at or above the limit or the offer is killed
+// (tecKILLED), so TakerPays is a guaranteed minimum output and the ALLORNOTHING Batch can pay that amount onward in the same Batch.
+export function offerSellXrp({ xrpDrops, quote, minQuote, fillOrKill = false }) {
   req(Number.isSafeInteger(xrpDrops) && xrpDrops > 0, "XRP drops required"); req(quote && isAcct(quote.issuer), "quote issuer required");
-  return { TransactionType: "OfferCreate", Flags: (FLAGS.tfImmediateOrCancel | FLAGS.tfSell) >>> 0, TakerGets: String(xrpDrops), TakerPays: { currency: quote.currency, issuer: quote.issuer, value: value(minQuote) } };
+  return { TransactionType: "OfferCreate", Flags: ((fillOrKill ? FLAGS.tfFillOrKill : FLAGS.tfImmediateOrCancel) | FLAGS.tfSell) >>> 0, TakerGets: String(xrpDrops), TakerPays: { currency: quote.currency, issuer: quote.issuer, value: value(minQuote) } };
 }

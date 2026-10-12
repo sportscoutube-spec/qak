@@ -282,7 +282,7 @@ export function botPlan({ loan, margin, now }) {
 //  loan: Loan entry (null if deleted); marked: {hash}|null (LoanManage tfLoanImpair/default seen); escrows: [{seq, drops, state: present|finished|canceled}]
 //  sales: [{hash, xrpDrops, quote}] broker sells after the finish; pays: [{hash, quote}] LoanPay on this LoanID after the mark;
 //  defaulted: {hash, vaultLoss, defaultCovered}|null; saleEnds: end of the sale window (Ripple time) or null; nextDue: amount LoanPay needs now.
-export function saleSteps({ loan = null, marked = null, escrows = [], sales = [], pays = [], defaulted = null, now, saleEnds = null, overdue = false, nextDue = null }) {
+export function saleSteps({ loan = null, marked = null, escrows = [], sales = [], shopPays = [], pays = [], defaulted = null, now, saleEnds = null, overdue = false, nextDue = null }) {
   const late = saleEnds != null && now > saleEnds, S = (status, detail, txs = []) => ({ status, detail, txs });
   const fin = escrows.filter((e) => e.state === "finished"), canc = escrows.filter((e) => e.state === "canceled"), pres = escrows.filter((e) => e.state === "present");
   const finDrops = fin.reduce((t, e) => t + e.drops, 0), soldDrops = sales.reduce((t, x) => t + x.xrpDrops, 0), proceeds = sales.reduce((t, x) => t + x.quote, 0), paid = pays.reduce((t, x) => t + x.quote, 0);
@@ -306,9 +306,25 @@ export function saleSteps({ loan = null, marked = null, escrows = [], sales = []
   else if (nextDue != null && proceeds < nextDue) s4 = S("stuck", `proceeds ${+proceeds.toFixed(6)} are below one installment (${+nextDue.toFixed(6)}); LoanPay takes no partial payment`);
   else s4 = S(late ? "stuck" : "waiting", "waiting for the shop's signed LoanPay (XLS-66 accepts LoanPay only from Loan.Borrower)");
   const leftover = Math.max(0, proceeds - paid);
-  return { steps: [["Mark the loan (LoanManage)", s1], ["Finish every escrow (EscrowFinish + fulfillment)", s2], ["Sell the XRP (OfferCreate on the DEX/AMM)", s3], ["LoanPay up to what is owed", s4]].map(([name, st], i) => ({ n: i + 1, name, ...st })),
-    proceeds, paid, undelivered: leftover, leftover, leftoverFixed: leftoverFixed({ loan, defaulted }), shortfall: defaulted ? defaulted.vaultLoss : null };
+  // XLS-56 Batch: finishes, the sale and the Payment to the shop that ran as inner txs of one outer Batch (ALLORNOTHING in the bot).
+  const batches = saleBatches({ escrows: fin, sales, shopPays });
+  s2.batches = batches.filter((b) => b.finishes.length); s3.batches = batches.filter((b) => b.sales.length);
+  if (s3.batches.length) s3.detail += `; atomic with the escrow finish${s3.batches.some((b) => b.shopPays.length) ? " and the Payment to the shop" : ""} via XLS-56 Batch (ALLORNOTHING)`;
+  return { steps: [["Mark the loan (LoanManage)", s1], ["Finish every escrow (EscrowFinish + fulfillment)", s2], ["Sell the XRP (OfferCreate on the DEX/AMM)", s3], ["LoanPay up to what is owed", s4]].map(([name, st], i) => ({ n: i + 1, name, batches: [], ...st })),
+    batches, shopFunded: shopPays.reduce((t, x) => t + x.quote, 0), proceeds, paid, undelivered: leftover, leftover, leftoverFixed: leftoverFixed({ loan, defaulted }), shortfall: defaulted ? defaulted.vaultLoss : null };
 }
+// Group inner txs by their outer Batch hash: [{outer, finishes: [hash], sales: [hash], shopPays: [hash]}].
+export function saleBatches({ escrows = [], sales = [], shopPays = [] }) {
+  const m = new Map(), get = (o) => (m.has(o) ? m.get(o) : m.set(o, { outer: o, finishes: [], sales: [], shopPays: [] }).get(o));
+  for (const e of escrows) if (e.finishBatch && e.finishHash) get(e.finishBatch).finishes.push(e.finishHash);
+  for (const x of sales) if (x.batch) get(x.batch).sales.push(x.hash);
+  for (const x of shopPays) if (x.batch) get(x.batch).shopPays.push(x.hash);
+  return [...m.values()];
+}
+// Leftover payouts in chunks of at most 8 (XLS-56: a Batch holds 2..8 inner txs; a chunk of 1 goes out as a plain Payment).
+export function leftoverChunks(list, n = 8) { if (!(n >= 2 && n <= 8)) throw new Error("chunk size must be 2..8"); const out = []; for (let i = 0; i < list.length; i += n) out.push(list.slice(i, i + n)); return out; }
+// Leftover payouts grouped by outer Batch (the bot pays up to 8 lenders per Batch, INDEPENDENT mode).
+export const leftoverBatches = (paid = []) => [...new Set(paid.map((x) => x.batch).filter(Boolean))];
 // ---------- Leftover proceeds to the pool's lenders, pro rata (app rule; the ledger does not enforce it) ----------
 // Leftover = sale proceeds the bot could not put into the loan by LoanPay (below one installment, or still with the broker once the
 // loan is defaulted or closed). The broker pays it to that pool's lenders off-ledger, outside the vault and the loan, in proportion to
@@ -351,9 +367,9 @@ export function proRata(total, holders) {
 // `self` = the broker wallet: its pro-rata part for shares it holds itself needs no Payment (status "kept: broker's own shares").
 export function leftoverStatus(split, { paid = [], lines = {}, self = null } = {}) {
   const rows = split.payouts.map((p) => { const ps = paid.filter((x) => x.to === p.account), got = ps.reduce((t, x) => t + x.amount, 0);
-    if (p.account === self) return { ...p, paid: 0, hashes: [], owed: 0, status: "kept: broker's own shares (no payment needed)" };
+    if (p.account === self) return { ...p, paid: 0, hashes: [], batches: [], owed: 0, status: "kept: broker's own shares (no payment needed)" };
     const owed = Math.max(0, +(p.amount - got).toFixed(LEFTOVER.DECIMALS));
-    return { ...p, paid: +got.toFixed(LEFTOVER.DECIMALS), hashes: ps.map((x) => x.hash), owed, status: owed === 0 ? "paid" : lines[p.account] === false ? "owed: no trust line" : "owed" }; });
+    return { ...p, paid: +got.toFixed(LEFTOVER.DECIMALS), hashes: ps.map((x) => x.hash), batches: [...new Set(ps.map((x) => x.batch).filter(Boolean))], owed, status: owed === 0 ? "paid" : lines[p.account] === false ? "owed: no trust line" : "owed" }; });
   return { rows, paid: rows.reduce((t, r) => t + r.paid, 0), owed: rows.reduce((t, r) => t + r.owed, 0) };
 }
 // The leftover is fixed only once the loan is defaulted or settled (or deleted); before that it may still go into a LoanPay.

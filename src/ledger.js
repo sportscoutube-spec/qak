@@ -114,7 +114,8 @@ export function balanceDelta(meta, account, asset) {
   return d;
 }
 const vaultLossOf = (meta) => { for (const n of meta?.AffectedNodes || []) { const x = n.ModifiedNode; if (x && x.LedgerEntryType === "Vault" && x.PreviousFields?.AssetsTotal != null) return Number(x.PreviousFields.AssetsTotal) - Number(x.FinalFields.AssetsTotal); } return null; };
-const txRow = (x) => { const tx = x.tx_json || x.tx || {}; return { tx, meta: x.meta, hash: x.hash || tx.hash, ledger: Number(x.ledger_index ?? tx.ledger_index), txIndex: Number(x.meta?.TransactionIndex ?? 0) }; };
+// batch = the outer XLS-56 Batch hash when the tx was an inner tx (metadata ParentBatchID), else null.
+const txRow = (x) => { const tx = x.tx_json || x.tx || {}; return { tx, meta: x.meta, hash: x.hash || tx.hash, ledger: Number(x.ledger_index ?? tx.ledger_index), txIndex: Number(x.meta?.TransactionIndex ?? 0), batch: x.meta?.ParentBatchID || null }; };
 async function accountTx(net, account, f) { const r = await rpc("account_tx", { account, ledger_index_min: -1, ledger_index_max: -1, limit: 400, forward: false }, f, rpcUrl(net)); return (r.transactions || []).map(txRow); }
 // Full history of an account (paged with marker, oldest first), capped at `max` transactions.
 export async function accountTxAll(net, account, f = globalThis.fetch, max = 5000) {
@@ -168,12 +169,15 @@ export async function saleInputs(net, { LoanID, broker, shop, escrows, quote }, 
     const can = txs.find((x) => x.tx.TransactionType === "EscrowCancel" && x.tx.Owner === e.owner && x.tx.OfferSequence === e.seq);
     let drops = node ? Number(node.Amount) : 0;
     if (!node && fin) drops = balanceDelta(fin.meta, broker, "XRP") + (fin.tx.Account === broker ? Number(fin.tx.Fee) : 0);
-    es.push({ owner: e.owner, seq: e.seq, drops, state: node ? "present" : fin ? "finished" : can ? "canceled" : "missing", finishHash: fin?.hash || null, node });
+    es.push({ owner: e.owner, seq: e.seq, drops, state: node ? "present" : fin ? "finished" : can ? "canceled" : "missing", finishHash: fin?.hash || null, finishBatch: fin?.batch || null, node });
   }
   const firstFin = es.map((e) => txs.find((x) => x.hash === e.finishHash)).filter(Boolean).map((x) => x.tx.date).sort((a, b) => a - b)[0] ?? null;
   const sales = firstFin == null ? [] : txs.filter((x) => x.tx.Account === broker && ["OfferCreate", "Payment"].includes(x.tx.TransactionType) && x.tx.date >= firstFin)
-    .map((x) => ({ hash: x.hash, xrpDrops: -(balanceDelta(x.meta, broker, "XRP") + Number(x.tx.Fee)), quote: balanceDelta(x.meta, broker, quote) }))
+    .map((x) => ({ hash: x.hash, batch: x.batch, xrpDrops: -(balanceDelta(x.meta, broker, "XRP") + Number(x.tx.Fee)), quote: balanceDelta(x.meta, broker, quote) }))
     .filter((x) => x.xrpDrops > 0 && x.quote > 0);
+  // Broker Payments of the vault asset to the shop after the first finish (funding the shop's own LoanPay), with their batch if any.
+  const shopPays = firstFin == null ? [] : txs.filter((x) => x.tx.Account === broker && x.tx.TransactionType === "Payment" && x.tx.Destination === shop && x.tx.date >= firstFin && !isLeftoverPay(x.tx, LoanID))
+    .map((x) => ({ hash: x.hash, batch: x.batch, quote: -balanceDelta(x.meta, broker, quote) })).filter((x) => x.quote > 0);
   const pays = markDate == null ? [] : txs.filter((x) => x.tx.TransactionType === "LoanPay" && x.tx.LoanID === LoanID && x.tx.date >= markDate)
     .map((x) => ({ hash: x.hash, quote: -balanceDelta(x.meta, x.tx.Account, quote) }));
   const defaulted = defTx ? { hash: defTx.hash, vaultLoss: vaultLossOf(defTx.meta), ledger: defTx.ledger, txIndex: defTx.txIndex } : null;
@@ -181,6 +185,6 @@ export async function saleInputs(net, { LoanID, broker, shop, escrows, quote }, 
   const lastPay = txs.filter((x) => x.tx.TransactionType === "LoanPay" && x.tx.LoanID === LoanID).pop();
   const fixedAt = defTx ? { ledger: defTx.ledger, txIndex: defTx.txIndex, by: "default", hash: defTx.hash } : (!loan || loan.PaymentRemaining === 0) && lastPay ? { ledger: lastPay.ledger, txIndex: lastPay.txIndex, by: "last LoanPay", hash: lastPay.hash } : null;
   const leftoverPays = txs.filter((x) => x.tx.Account === broker && x.tx.TransactionType === "Payment" && isLeftoverPay(x.tx, LoanID))
-    .map((x) => ({ hash: x.hash, to: x.tx.Destination, amount: -balanceDelta(x.meta, broker, quote) }));
-  return { loan, marked: markTx ? { hash: markTx.hash, date: markDate } : null, escrows: es, sales, pays, defaulted, fixedAt, leftoverPays };
+    .map((x) => ({ hash: x.hash, batch: x.batch, to: x.tx.Destination, amount: -balanceDelta(x.meta, broker, quote) }));
+  return { loan, marked: markTx ? { hash: markTx.hash, date: markDate } : null, escrows: es, sales, shopPays, pays, defaulted, fixedAt, leftoverPays };
 }
