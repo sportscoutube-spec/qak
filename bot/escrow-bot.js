@@ -151,7 +151,7 @@ async function readAll(c, p, w) {
   const [loan, broker, vault] = [await node(c, { index: p.LoanID }), await node(c, { index: p.LoanBrokerID }), await node(c, { index: p.VaultID })];
   if (!broker || !vault) throw new Error("LoanBroker or Vault not found");
   const quote = { currency: vault.Asset.currency, issuer: vault.Asset.issuer };
-  const exp = { owner: p.shop, destination: broker.Owner, condition: p.condition, cancelAfterMin: vault.RedemptionDate + w.CANCEL_AFTER_MARGIN_SECONDS };
+  const exp = { owner: p.shop, destination: broker.Owner, condition: p.condition, cancelAfterMin: S.cancelAfterFor(vault.RedemptionDate, { GracePeriod: loan?.GracePeriod ?? p.gracePeriod }, w) };
   const escrows = []; for (const e of p.escrows) escrows.push({ ...e, node: await node(c, { escrow: { owner: e.owner, seq: e.seq } }) });
   const set = S.escrowSet(escrows, exp);
   const mk = await L.marketDepth(p.network, globalThis.fetch, { rpc: NETS[p.network].rpc, quote, label: "vault asset vs XRP", unit: "" });

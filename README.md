@@ -76,7 +76,7 @@ the ledger does not enforce is an **app rule**.
 
 1. The broker makes a 32-byte preimage: `node bot/escrow-bot.js condition --out <file outside the repo>` (mode 0600; prints
    only the PREIMAGE-SHA-256 Condition) and publishes the Condition on the pool page.
-2. The shop signs `EscrowCreate` in Xaman: XRP to the broker wallet, `Condition`, `CancelAfter` = RedemptionDate + 1 day,
+2. The shop signs `EscrowCreate` in Xaman: XRP to the broker wallet, `Condition`, `CancelAfter` = RedemptionDate + the loan's GracePeriod + 1 day,
    `FinishAfter` = SubscriptionDate + PaymentInterval (only while still in the future).
 3. The app reads the escrow by owner + sequence (`ledger_entry`) and checks Destination, Condition, Amount and CancelAfter.
    LoanSet stays blocked until it passes, the opening ratio is ≥ 150%, and the app LoanSet deadline has not passed.
@@ -129,7 +129,7 @@ Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file k
 | `ESCROW.ADD_LINE_PCT` / `DEFAULT_LINE_PCT` | 150 / 120 | app rule |
 | `ESCROW.ADD_WINDOW_SECONDS` | 72 h | app rule (flagged) |
 | `ESCROW.SALE_WINDOW_SECONDS` | 3 days after grace | app rule (flagged) |
-| `ESCROW.CANCEL_AFTER_MARGIN_SECONDS` | 1 day after RedemptionDate | app rule (flagged) |
+| `ESCROW.CANCEL_AFTER_BUFFER_SECONDS` | CancelAfter = RedemptionDate + GracePeriod + 1 day (24 h buffer; devnet proof runs use 15 min) | app rule (flagged) |
 | `ESCROW.LOANSET_SLACK_DAYS` | 3 | app rule |
 | `ESCROW.SELL_MAX_SLIPPAGE_PCT` | 3 | bot limit price |
 | `NO_XRP.MAX_CAP_RLUSD` | 1,000 | app rule (flagged) |
@@ -139,7 +139,8 @@ Shops with no XRP use the cover-only path: cap ≤ 1,000 RLUSD and a desk file k
 - **Finish at any time.** With a Condition, the broker can finish whenever it holds the fulfillment (after FinishAfter, before
   CancelAfter). "A price drop never finishes the escrow" and "sale only after LoanManage" are app rules.
 - **XRP back to a repaying shop** only via `EscrowCancel` after CancelAfter (earlier: `tecNO_PERMISSION`). CancelAfter sits
-  after RedemptionDate, and the app LoanSet deadline (RedemptionDate − term − grace − sale window) keeps the bot's work inside it.
+  at RedemptionDate + GracePeriod + a 24 h buffer, and the app LoanSet deadline (RedemptionDate − term − grace − sale window) keeps the
+  bot's work inside it, with the grace period and buffer as room for a late sale (the ledger refuses EscrowFinish after CancelAfter).
 - **LoanPay is borrower-only** (`tecNO_PERMISSION` for the broker). It works on an impaired loan (and unimpairs it) and fails
   `tecKILLED` after default. A late payment settles one installment, with no partial payments. So step 4 is a LoanPay the shop
   signs without submitting (Xaman `submit:false`); the bot funds the shop with exactly that amount and submits it. VaultDeposit

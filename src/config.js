@@ -123,7 +123,8 @@ export const ESCROW = {
   DEFAULT_LINE_PCT: 120,               // brief: window expired under this = the bot runs (after LoanManage)
   ADD_WINDOW_SECONDS: 72 * H,          // FLAG app rule (product choice): 72 h to add a second escrow or LoanPay down the balance
   SALE_WINDOW_SECONDS: 3 * 86400,      // FLAG app rule: time the bot has after the mark for steps 2-4 before LoanManage default of the rest
-  CANCEL_AFTER_MARGIN_SECONDS: 86400,  // FLAG app rule: CancelAfter = RedemptionDate + 1 day (see escrowTimes in state.js)
+  CANCEL_AFTER_BUFFER_SECONDS: 86400,  // FLAG app rule: CancelAfter = RedemptionDate + the loan's GracePeriod + this 24 h buffer (cancelAfterFor in state.js),
+                                       // so a default and sale that run to the end of the grace period can still finish the escrow. Devnet proof runs use a shorter buffer.
   LOANSET_SLACK_DAYS: 3,               // app rule: days after SubscriptionDate in which LoanSet must happen (sizes the investment window)
   PREIMAGE_BYTES: 32,                  // fulfillment = 32 random bytes (xrpl.org: "at least 32 random bytes")
   SELL_MAX_SLIPPAGE_PCT: 3,            // app rule: the bot's OfferCreate limit price is the quote minus 3%

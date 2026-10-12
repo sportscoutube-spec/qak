@@ -168,9 +168,12 @@ export const appLoanSetDeadline = (v, t, w = E) => v.RedemptionDate - loanMaturi
 //  so the shop cannot EscrowCancel before default handling ends. A shop that repays gets its XRP back only after CancelAfter (EscrowCancel).
 //  FinishAfter = SubscriptionDate + PaymentInterval: no loan can have a payment overdue earlier (LoanSet only after SubscriptionDate), so the
 //  ledger refuses any EscrowFinish before it. Set only while it is still in the future (no past times in EscrowCreate); omitted for later escrows.
+// CancelAfter = RedemptionDate + GracePeriod + buffer: the last payment can fall due at RedemptionDate at the latest, default comes only after
+// its grace period, and the buffer leaves time for the bot's EscrowFinish + sale after that.
+export const cancelAfterFor = (red, t, w = E) => { req(Number.isInteger(red), "needs the vault's RedemptionDate"); req(Number.isInteger(t?.GracePeriod) && t.GracePeriod >= 0, "needs the loan's GracePeriod"); return red + t.GracePeriod + w.CANCEL_AFTER_BUFFER_SECONDS; };
 export function escrowTimes(v, t, now, w = E) {
   req(v && Number.isInteger(v.SubscriptionDate) && Number.isInteger(v.RedemptionDate), "needs the vault's SubscriptionDate and RedemptionDate (VaultCreate first)");
-  const CancelAfter = v.RedemptionDate + w.CANCEL_AFTER_MARGIN_SECONDS, fa = v.SubscriptionDate + t.PaymentInterval;
+  const CancelAfter = cancelAfterFor(v.RedemptionDate, t, w), fa = v.SubscriptionDate + t.PaymentInterval;
   return { CancelAfter, FinishAfter: now != null && fa > now + 60 ? fa : undefined };
 }
 // Check one Escrow entry read by owner + sequence against what the pool expects.

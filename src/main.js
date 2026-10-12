@@ -82,7 +82,7 @@ const xrpNeeded = (net, mk, owedNet) => { const k = `${net}|${mk.d?.fetchedAt?.g
 function escrowView(p) {
   const c = LG.pool[p.id] || {}, b = c.broker, loan = c.loan, v = c.vault, now = S.nowRipple();
   const red = v ? v.RedemptionDate : p.ledger.RedemptionDate, sub = v ? v.SubscriptionDate : p.ledger.SubscriptionDate;
-  const exp = { owner: p.account, destination: b ? b.Owner : null, condition: p.escrow.condition, cancelAfterMin: red != null ? red + ESCROW.CANCEL_AFTER_MARGIN_SECONDS : Infinity };
+  const exp = { owner: p.account, destination: b ? b.Owner : null, condition: p.escrow.condition, cancelAfterMin: red != null ? S.cancelAfterFor(red, p.terms) : Infinity };
   const e = LG.esc[p.id], set = e && e.list ? S.escrowSet(e.list, exp) : null, net = marketNet(p), mk = marketOf(net), ok = mk.pool || (mk.levels && mk.levels.length);
   const live = loan && loan.PaymentRemaining > 0 && b, owed = live ? S.owedAfterCover({ ...loan, DebtTotal: b.DebtTotal, CoverAvailable: b.CoverAvailable, CoverRateMinimum: b.CoverRateMinimum, CoverRateLiquidation: b.CoverRateLiquidation }) : S.plannedOwed(p);
   const xrp = set ? set.drops / S.DROPS : 0, q = ok ? S.sellQuote({ ...mk, xrp }) : null, ratio = q && xrp > 0 ? S.escrowRatioPct(q.best, owed.net) : null;
@@ -226,7 +226,7 @@ function escrowCard(p) {
   <p class="note">XLS-66 does not take this XRP as collateral and does not sell it. The shop's EscrowCreate sends XRP to the broker wallet under a PREIMAGE-SHA-256 Condition; the broker holds the fulfillment. LoanSet stays blocked in this app until the escrow is found on the ledger (ledger_entry by owner + sequence) with the right Destination, Condition, XRP amount and CancelAfter.</p>
   <table><tr><td>Condition (published by the broker)</td><td>${isCond(p) ? `<code>${esc(p.escrow.condition)}</code>` : NC}</td></tr>
   <tr><td>Destination (LoanBroker.Owner)</td><td>${b ? `<code>${esc(b.Owner)}</code>` : NC}</td></tr>
-  <tr><td>CancelAfter</td><td>${times ? `${esc(athens(S.fromRipple(times.CancelAfter)))} = RedemptionDate + ${days(ESCROW.CANCEL_AFTER_MARGIN_SECONDS)} (app rule)` : `RedemptionDate + ${days(ESCROW.CANCEL_AFTER_MARGIN_SECONDS)}; ${NC}`}. Before it the shop cannot EscrowCancel; after it anyone can, and the XRP returns to the shop. The broker cannot finish after it.</td></tr>
+  <tr><td>CancelAfter</td><td>${times ? `${esc(athens(S.fromRipple(times.CancelAfter)))} = RedemptionDate + grace period (${days(p.terms.GracePeriod)}) + ${days(ESCROW.CANCEL_AFTER_BUFFER_SECONDS)} buffer (app rule)` : `RedemptionDate + grace period + ${days(ESCROW.CANCEL_AFTER_BUFFER_SECONDS)} buffer; ${NC}`}. Before it the shop cannot EscrowCancel; after it anyone can, and the XRP returns to the shop. The broker cannot finish after it.</td></tr>
   <tr><td>FinishAfter</td><td>SubscriptionDate + PaymentInterval${times ? ` (${times.FinishAfter ? esc(athens(S.fromRipple(times.FinishAfter))) : "already past: omitted for an escrow created now"})` : ""}: no payment can be overdue earlier, and the ledger refuses EscrowFinish before it.</td></tr>
   <tr><td>Escrow sequences</td><td>${rows ? `<ul>${rows}</ul>` : "none on record"}${ev.e?.err ? `<br><span class="warn">read failed: ${esc(ev.e.err)}</span>` : ""}</td></tr>
   ${marketRows(ev.mk, ev.xrp, unitOf(p))}

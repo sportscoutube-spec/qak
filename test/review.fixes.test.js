@@ -54,4 +54,17 @@ await t("leftover 0 with share holders is reported as nothing to distribute, not
   assert.match(noPayoutReason(split, holders), /nothing to distribute to the 2 share holders/); assert.doesNotMatch(noPayoutReason(split, holders), /no share holders/);
   assert.match(noPayoutReason(S.proRata(5, []), []), /no share holders/);
 });
+await t("CancelAfter = RedemptionDate + GracePeriod + 24 h buffer, used by escrowTimes, the app check, the bot check and run-e", async () => {
+  const { ESCROW } = await import("../src/config.js"); assert.equal(ESCROW.CANCEL_AFTER_BUFFER_SECONDS, 86400);
+  assert.equal(S.cancelAfterFor(1000, { GracePeriod: 60 }), 1000 + 60 + 86400);
+  assert.equal(S.cancelAfterFor(1000, { GracePeriod: 60 }, { CANCEL_AFTER_BUFFER_SECONDS: 900 }), 1960);
+  assert.throws(() => S.cancelAfterFor(1000, {}), /GracePeriod/); assert.throws(() => S.cancelAfterFor(null, { GracePeriod: 1 }), /RedemptionDate/);
+  const v = { SubscriptionDate: 0, RedemptionDate: 5000 }, t = { PaymentInterval: 240, GracePeriod: 60 };
+  assert.equal(S.escrowTimes(v, t, 0, { ...ESCROW, CANCEL_AFTER_BUFFER_SECONDS: 900 }).CancelAfter, 5960);
+  // run-e's case: RedemptionDate + 120 s had passed when the bot sold; with grace + buffer the same escrow is still finishable.
+  assert(finishable({ CancelAfter: S.cancelAfterFor(845109240, { GracePeriod: 60 }, { CANCEL_AFTER_BUFFER_SECONDS: 900 }) }, 845109672).ok);
+  for (const f of ["../src/main.js", "../bot/escrow-bot.js"]) { const src = fs.readFileSync(new URL(f, import.meta.url), "utf8");
+    assert(/cancelAfterFor\(/.test(src), `${f} uses cancelAfterFor`); assert(!/RedemptionDate \+ (w|ESCROW)\.CANCEL_AFTER/.test(src), `${f} has no old rule`); }
+  const ui = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"); assert(/RedemptionDate \+ grace period/.test(ui));
+});
 done("test/review.fixes.test.js");

@@ -7,7 +7,7 @@ const SHOP = "rBZaALm7Pz1bGq5yvN2nYb9E1S1U6s2d1F", BROKER = "rBRR9DokhcK4TofnNm4
 const COND = "A0258020" + "AB".repeat(32) + "810120", Q = { currency: "USD", issuer: ISS };
 
 // Config values (flagged app rules)
-assert.equal(E.ADD_LINE_PCT, 150); assert.equal(E.DEFAULT_LINE_PCT, 120); assert(E.ADD_WINDOW_SECONDS > 0 && E.SALE_WINDOW_SECONDS > 0 && E.CANCEL_AFTER_MARGIN_SECONDS > 0);
+assert.equal(E.ADD_LINE_PCT, 150); assert.equal(E.DEFAULT_LINE_PCT, 120); assert(E.ADD_WINDOW_SECONDS > 0 && E.SALE_WINDOW_SECONDS > 0 && E.CANCEL_AFTER_BUFFER_SECONDS > 0);
 assert.equal(NO_XRP.MAX_CAP_RLUSD, 1000); assert.equal(FIRST_POOL.path, PATHS.escrow); assert.equal(FIRST_POOL.capRlusd, 10000);
 assert.equal(MARKETS.mainnet.quote.currency, "524C555344000000000000000000000000000000"); assert.equal(MARKETS.testnet, null); ok("config: lines 150/120, windows, no-XRP cap 1,000, first pool on the escrow path");
 
@@ -26,7 +26,7 @@ assert.equal(MARKETS.mainnet.quote.currency, "524C555344000000000000000000000000
 
 // Escrow times fit the windows
 { const t = FIRST_POOL.terms, v = { SubscriptionDate: 1_000_000, RedemptionDate: 1_000_000 + FIRST_POOL.plan.investmentDays * 86400 };
-  const x = S.escrowTimes(v, t, v.SubscriptionDate - 3600); assert.equal(x.CancelAfter, v.RedemptionDate + E.CANCEL_AFTER_MARGIN_SECONDS); assert.equal(x.FinishAfter, v.SubscriptionDate + t.PaymentInterval);
+  const x = S.escrowTimes(v, t, v.SubscriptionDate - 3600); assert.equal(x.CancelAfter, v.RedemptionDate + t.GracePeriod + E.CANCEL_AFTER_BUFFER_SECONDS); assert.equal(x.FinishAfter, v.SubscriptionDate + t.PaymentInterval);
   assert.equal(S.escrowTimes(v, t, v.SubscriptionDate + t.PaymentInterval).FinishAfter, undefined);
   const dl = S.appLoanSetDeadline(v, t); assert(dl > v.SubscriptionDate, "deadline after subscription");
   assert(dl + S.loanMaturitySpan(t) + t.GracePeriod + E.SALE_WINDOW_SECONDS <= v.RedemptionDate && v.RedemptionDate < x.CancelAfter, "default handling ends before CancelAfter");
