@@ -59,7 +59,7 @@ await t("UI: apply page has the access check and an optional label; no shop name
 });
 await t("structure: one borrower = one vault + one broker + one loan; DebtMaximum = AssetsMaximum = the borrower's cap", () => {
   const s = S.seed(); const p = S.apply(s, { account: A, capRlusd: "2500", ratePct: "10", paymentTotal: "2", intervalDays: "30", graceDays: "7", access: { ok: true } });
-  const V = "C".repeat(64); S.recordLedger(s, p.id, "VaultID", V); assert.throws(() => S.recordLedger(s, "first", "VaultID", V), /another borrower/);
+  const V = "C".repeat(64); const VE = { entry: { LedgerEntryType: "Vault", index: V } }; S.recordLedger(s, p.id, "VaultID", V, VE); assert.throws(() => S.recordLedger(s, "first", "VaultID", V, VE), /another borrower/);
   assert.throws(() => S.recordLedger(s, p.id, "LoanID", "D".repeat(64)) && S.recordLedger(s, p.id, "LoanID", "E".repeat(64)), /already set/);
   const lbs = P.loanBrokerSet({ VaultID: V, ManagementFeeRate: RULES.FEE_RATE, DebtMaximum: p.capRlusd }); assert.equal(lbs.DebtMaximum, "2500"); assert.equal(lbs.ManagementFeeRate, 1000);
 });

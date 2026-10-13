@@ -26,7 +26,7 @@ const unitOf = (p) => NETWORKS[p.network]?.asset.unit || ASSET;
 const curPage = () => location.hash.replace(/^#\/?/, "").split("/")[0];
 const RECHECK_MS = 10 * 60 * 1000; // Status keeps re-checking the three amendments
 const soft = (pgs) => { if (pgs.includes(curPage())) route(); };
-const LG = { issuer: null, issuerErr: null, issuerLoading: false, issuerAt: 0, bal: null, balErr: null, balLoading: false, pool: {}, market: {}, esc: {}, sale: {}, xrpIn: {}, live: null, access: {} };
+const LG = { issuer: null, issuerErr: null, issuerLoading: false, issuerAt: 0, bal: null, balErr: null, balLoading: false, pool: {}, market: {}, esc: {}, sale: {}, xrpIn: {}, live: null, access: {}, share: {} };
 const FEAT = Object.fromEntries(Object.keys(NETWORKS).map((k) => [k, { data: null, err: null, at: null, loading: false }]));
 const FEAT_PAGES = ["", "pool", "lend", "status"];
 function checkFeatures(net) { const f = FEAT[net]; if (f.loading) return; f.loading = true; f.err = null; soft(["status"]);
@@ -38,6 +38,13 @@ function loadBalance() { const w = X.wallet; if (w.mode !== "xaman" || !w.accoun
   if (LG.balLoading || (LG.bal && LG.bal.account === w.account)) return; LG.balLoading = true; LG.balErr = null;
   L.qakBalance(w.account).then((b) => { LG.bal = b; }).catch((e) => { LG.bal = null; LG.balErr = e.message || "unavailable"; }).finally(() => { LG.balLoading = false; const el = document.getElementById("ledgerqak"); if (el) el.value = balText(); soft(["lend", "pool"]); }); }
 // Lifetime access of an account, read from mainnet account_tx (paged). Cached 5 minutes; a failed read is shown, never treated as access.
+// Connected lender's vault MPT share per pool, read from the ledger (Xaman only; the mock wallet has no ledger holdings).
+function loadShare(p) { const w = X.wallet; if (w.mode !== "xaman" || !w.account || !p.ledger.VaultID) return; const k = `${w.account}:${p.ledger.VaultID}`;
+  if (LG.share[k]) return; LG.share[k] = { loading: true };
+  L.vaultShareBalance(p.network, w.account, p.ledger.VaultID).then((r) => { LG.share[k] = r; }).catch((e) => { LG.share[k] = { err: e.message || "unavailable" }; }).finally(() => soft(["lend"])); }
+function shareText(p) { const w = X.wallet; if (!w.account || w.mode !== "xaman" || !p.ledger.VaultID) return "none";
+  const r = LG.share[`${w.account}:${p.ledger.VaultID}`]; if (!r || r.loading) return "reading the ledger…"; if (r.err) return `unavailable (${esc(r.err)})`;
+  return r.amount > 0 ? `${esc(String(r.amount))} (MPT ${esc(r.shareId.slice(0, 12))}…)` : "none"; }
 function loadAccess(account) { if (!account || account === S.PREVIEW_ACCOUNT) return; const c = (LG.access[account] ||= { loading: false, at: 0 });
   if (c.loading || (c.r && c.r.ok) || Date.now() - c.at < 300000) return; c.loading = true; c.err = null;
   L.accessStatus(account).then((r) => { c.r = r; }).catch((e) => { c.err = e.message || "unavailable"; }).finally(() => { c.loading = false; c.at = Date.now(); soft(["apply", "pool"]); }); }
@@ -185,7 +192,9 @@ async function runAction(p, a) {
       if (!t.validated || t.result !== "tesSUCCESS") throw new Error(`EscrowCreate ${t.result || "not validated yet"}; record it by sequence once validated`);
       S.recordEscrow(st, p.id, { owner: t.account, seq: t.seq, hash: r.txid }); save(); LG.esc[p.id] = null; say(`Escrow created: owner ${t.account}, sequence ${t.seq}.`); route(); return; }
     if (CREATES[a.key] && r.txid) { await new Promise((res) => setTimeout(res, 8000)); const id = await L.createdId(p.network, r.txid, CREATES[a.key][0]);
-      S.recordLedger(st, p.id, CREATES[a.key][1], id);
+      // VaultID: 64-hex and confirmed by ledger_entry before it is stored; a bad id is ignored, never stored.
+      const entry = a.key === "VaultCreate" ? await L.ledgerEntry(p.network, id).catch(() => null) : undefined;
+      try { S.recordLedger(st, p.id, CREATES[a.key][1], id, { entry }); } catch (e) { say(`${CREATES[a.key][1]} not recorded: ${e.message}`); return; }
       if (a.key === "VaultCreate") { S.recordLedger(st, p.id, "SubscriptionDate", a.tx.SubscriptionDate); S.recordLedger(st, p.id, "RedemptionDate", a.tx.RedemptionDate); }
       if (a.key === "LoanBrokerSet") S.recordLedger(st, p.id, "ManagementFeeRate", a.tx.ManagementFeeRate);
       save(); LG.pool[p.id] = null; route(); }
@@ -356,11 +365,11 @@ const pages = {
    <p class="note">${esc(X.XAMAN_SUPPORT.escrow)} LoanSet follows XLS-66 §3.8.3: the broker signs first with Counterparty = the borrower; the borrower then fills CounterpartySignature and submits. ${esc(X.XAMAN_SUPPORT.counterparty)}</p>
    <pre id="txout" class="out"></pre>
    <ul>${p.log.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`; },
-  lend: () => { const g = gateFor("devnet"); return `<h1>Lender panel</h1>
+  lend: () => { const g = gateFor("devnet"); st.pools.forEach(loadShare); return `<h1>Lender panel</h1>
    <div class="card">Wallet: ${esc(X.wallet.account || "not connected")}${X.wallet.mode === "mock" ? " (mock)" : ""}<br>QAK balance (ledger): ${esc(balText())}<br>
    <button disabled>Deposit: open a pool page; VaultDeposit only in its subscription window</button><br><span class="off">${g.ok ? "" : esc(g.reasons.join(" "))}</span></div>
    <div class="card"><h3>What you hold</h3>A VaultDeposit returns the vault MPT share, issued by that vault's pseudo-account. It is the receipt for that borrower's vault only, and it is redeemable from RedemptionDate. During the investment window it cannot be withdrawn.
-   <table><tr><th>Pool</th><th>VaultID</th><th>Your vault MPT share</th></tr>${st.pools.map((p) => `<tr><td>${esc(nameOf(p))}</td><td>${p.ledger.VaultID ? `<code>${esc(p.ledger.VaultID.slice(0, 12))}…</code>` : NC}</td><td>${p.ledger.VaultID ? "read from the ledger (MPToken of the vault's ShareMPTID)" : "none"}</td></tr>`).join("")}</table></div>
+   <table><tr><th>Pool</th><th>VaultID</th><th>Your vault MPT share</th></tr>${st.pools.map((p) => `<tr><td>${esc(nameOf(p))}</td><td>${p.ledger.VaultID ? `<code>${esc(p.ledger.VaultID.slice(0, 12))}…</code>` : NC}</td><td>${shareText(p)}</td></tr>`).join("")}</table></div>
    <div class="card"><h3>Lent asset per network</h3><table>${Object.values(NETWORKS).map((x) => `<tr><td>${esc(x.label)}</td><td>${esc(x.asset.label)}</td><td>${x.asset.issuer ? esc(x.asset.issuer) : `<span class="warn">${esc(x.asset.placeholder || "not set")}</span>`}</td></tr>`).join("")}</table></div>
    <div class="card"><h3>QAK</h3><table>${qakRow}</table>${lineNote}</div>
    <div class="card"><h3>If a borrower misses</h3>The broker marks the loan (LoanManage tfLoanImpair), finishes the borrower's XRP escrows, sells the XRP and gets the proceeds into the loan by a LoanPay the borrower has signed. What the sale does not cover, and the ${ASSET} cover does not cover at default, is written down on that vault. The pool page shows each of the four steps as done or stuck.

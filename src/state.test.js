@@ -103,7 +103,7 @@ ok("tokenomics, team, roadmap");
   assert(/^p_[0-9a-f-]{36}$/.test(p.id)); assert(S.planFits(p.plan, p.terms)); assert.equal(S.apply(s, { ...f, label: "  " }).label, null, "label is optional");
   for (const k of ["shop", "city", "purpose", "votes", "capVotes", "voters", "listingLock", "stage", "path", "deskFile", "shopHoldingQak"]) assert(!(k in p), k + " gone");
   assert(!("queue" in s)); for (const fn of ["vote", "voteCap", "enqueue"]) assert.equal(S[fn], undefined, fn + " removed");
-  const V = "B".repeat(64); S.recordLedger(s, p.id, "VaultID", V); assert.throws(() => S.recordLedger(s, p.id, "VaultID", "C".repeat(64)), /already set/);
+  const V = "B".repeat(64); S.recordLedger(s, p.id, "VaultID", V, { entry: { LedgerEntryType: "Vault", index: V } }); assert.throws(() => S.recordLedger(s, p.id, "VaultID", "C".repeat(64)), /already set/);
   assert.throws(() => S.recordLedger(s, "first", "VaultID", V), /another borrower/); ok("application: any account with lifetime access; optional label; one borrower per vault; no votes or queue"); }
 
 // Lifetime access from account_tx rows (delivered_amount, QAK issuer, destination, validated, tesSUCCESS)
@@ -125,7 +125,7 @@ ok("tokenomics, team, roadmap");
   bad.pools.push({ ...t, id: "x<img>" }, { ...t, id: "ok2", label: "y".repeat(500) }, { ...t, id: "ok3", terms: { ...t.terms, GracePeriod: t.terms.PaymentInterval + 1 } }, { ...t }, null,
     { ...t, id: "ok4", ledger: { ...t.ledger, VaultID: "fake-id" } }, { ...t, id: "ok5", capRlusd: 20000 }, { ...t, id: "ok6", path: "cover-only" }, { ...t, id: "ok7", ledger: { ...t.ledger, ManagementFeeRate: 750 } });
   const old = { ...t, id: "old", shop: "Kostas", city: "Athens", purpose: "stock", votes: { yes: 5, no: 0 }, capVotes: {}, voters: [], listingLock: { qak: 250000 }, stage: "listed" }; bad.pools.push(old); bad.queue = [{ who: A }];
-  const c = S.sanitizeState(bad); assert.equal(c.pools.length, 3); assert.equal(S.sanitizeState({ pools: "x" }), null); assert.equal(S.sanitizeState(null), null);
+  const c = S.sanitizeState(bad); assert.equal(c.pools.length, 5, "bad ledger values are ignored (nulled), not the whole pool"); assert.equal(c.pools.find((x) => x.id === "ok4").ledger.VaultID, null); assert.equal(c.pools.find((x) => x.id === "ok7").ledger.ManagementFeeRate, null); assert.equal(S.sanitizeState({ pools: "x" }), null); assert.equal(S.sanitizeState(null), null);
   const o = c.pools.find((x) => x.id === "old"); for (const k of ["shop", "city", "purpose", "votes", "listingLock", "stage"]) assert(!(k in o), k + " not carried over"); assert(!("queue" in c));
   const two = JSON.parse(JSON.stringify(s)); two.pools[0].ledger.VaultID = "D".repeat(64); two.pools[1].ledger.VaultID = "D".repeat(64); assert.equal(S.sanitizeState(two).pools.length, 1, "second borrower on the same vault dropped");
   assert.equal(p.ledger.LoanID, null); ok("load-time validation drops bad records, duplicate vaults, the cover-only path and old shop-era fields"); }

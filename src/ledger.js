@@ -57,6 +57,16 @@ export async function featureStatus(net, f=globalThis.fetch){
 export async function ledgerEntry(net, index, f=globalThis.fetch){
   if(!/^[0-9A-F]{64}$/.test(index||"")) throw new Error("bad ledger id");
   const res=await rpc("ledger_entry",{index,ledger_index:"validated"},f,NETWORKS[net].rpc); return res.node; }
+// The connected lender's holding of a vault's share: Vault entry -> ShareMPTID -> MPToken(account, issuance). Read-only.
+// Returns { shareId, amount } with amount 0 when the account holds no MPToken for that issuance.
+export async function vaultShareBalance(net, account, VaultID, f = globalThis.fetch) {
+  if (!isAcct(account)) throw new Error("bad account");
+  const v = await ledgerEntry(net, VaultID, f); if (!v || v.LedgerEntryType !== "Vault") throw new Error("not a Vault");
+  const shareId = v.ShareMPTID; if (!/^[0-9A-F]{48}$/i.test(shareId || "")) throw new Error("Vault has no ShareMPTID");
+  try { const m = (await rpc("ledger_entry", { mptoken: { mpt_issuance_id: shareId, account }, ledger_index: "validated" }, f, rpcUrl(net))).node;
+    const a = Number(m?.MPTAmount ?? 0); return { shareId, amount: Number.isFinite(a) && a > 0 ? a : 0 }; }
+  catch (e) { if (/entryNotFound|objectNotFound/.test(e.message)) return { shareId, amount: 0 }; throw e; }
+}
 // After a validated transaction: the LedgerIndex of the CreatedNode of a given type (e.g. "Vault", "LoanBroker", "Loan").
 export async function createdId(net, txid, type, f=globalThis.fetch){
   if(!/^[0-9A-F]{64}$/.test(txid||"")) throw new Error("bad tx hash");

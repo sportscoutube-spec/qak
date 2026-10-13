@@ -176,13 +176,43 @@ await t("8 LoanSet missing its second signature is refused (temBAD_SIGNER) and a
 // 9. Sample row
 await t("9 sample row: VaultID 'not created yet' and share 'none' until a real VaultID; seed has no VaultID", () => {
   const s = S.seed(), sp = s.pools.find((p) => p.sample); assert(sp && !sp.ledger.VaultID);
-  assert(/p\.ledger\.VaultID \? `<code>.*?: NC\}/.test(LEND) && /p\.ledger\.VaultID \? "read from the ledger.*?" : "none"/.test(LEND)); assert(/not created yet/.test(MAIN.match(/const NC = .*/)[0]));
+  assert(/p\.ledger\.VaultID \? `<code>.*?: NC\}/.test(LEND) && /\$\{shareText\(p\)\}/.test(LEND)); // share column: "none" with no VaultID (see the share-column test) assert(/not created yet/.test(MAIN.match(/const NC = .*/)[0]));
 });
-await t("9 a non-ledger VaultID never flips the sample row: recordLedger rejects a malformed id", () => {
-  const s = S.seed(), sp = s.pools.find((p) => p.sample); let stored = false;
-  try { S.recordLedger(s, sp.id, "VaultID", "<not a ledger id>"); stored = sp.ledger.VaultID === "<not a ledger id>"; } catch {}
-  const kept = stored ? S.sanitizeState(JSON.parse(JSON.stringify(s))).pools.length : 1;
-  assert(!stored, `recordLedger stored a malformed VaultID (row now shows it instead of "not created yet" and share "read from the ledger" instead of "none"); on reload sanitizeState then drops ${1 - kept} of 1 pools [state.js:466-471, caller main.js:187-188 stores createdId's LedgerIndex unchecked, ledger.js:61-67]`);
+await t("9 a non-ledger VaultID never flips the sample row: recordLedger rejects a malformed or unconfirmed id", () => {
+  const s = S.seed(), sp = s.pools.find((p) => p.sample);
+  for (const bad of ["<not a ledger id>", "a".repeat(64), "A".repeat(63), null]) assert.throws(() => S.recordLedger(s, sp.id, "VaultID", bad, { entry: { LedgerEntryType: "Vault" } }), /not a valid ledger value/);
+  assert.throws(() => S.recordLedger(s, sp.id, "VaultID", V), /did not return a Vault/, "no ledger_entry confirmation");
+  assert.throws(() => S.recordLedger(s, sp.id, "VaultID", V, { entry: { LedgerEntryType: "Loan", index: V } }), /did not return a Vault/);
+  assert.throws(() => S.recordLedger(s, sp.id, "VaultID", V, { entry: { LedgerEntryType: "Vault", index: "C".repeat(64) } }), /different Vault/);
+  assert.equal(sp.ledger.VaultID, null); assert(/p\.ledger\.VaultID \? `<code>.*?: NC\}/.test(LEND));
+  S.recordLedger(s, sp.id, "VaultID", V, { entry: { LedgerEntryType: "Vault", index: V } }); assert.equal(sp.ledger.VaultID, V);
+  assert(/await L\.ledgerEntry\(p\.network, id\)/.test(MAIN) && /S\.recordLedger\(st, p\.id, CREATES\[a\.key\]\[1\], id, \{ entry \}\)/.test(MAIN), "main.js confirms via ledger_entry before storing");
+});
+await t("9 a bad stored id is ignored on load, never the whole pool", () => {
+  const s = S.seed(); s.pools[0].ledger.VaultID = "<bad>"; s.pools[0].ledger.LoanID = "zz"; const r = S.sanitizeState(JSON.parse(JSON.stringify(s)));
+  assert.equal(r.pools.length, 1); assert.equal(r.pools[0].ledger.VaultID, null); assert.equal(r.pools[0].ledger.LoanID, null);
+  const ok = S.seed(); ok.pools[0].ledger.VaultID = V; assert.equal(S.sanitizeState(JSON.parse(JSON.stringify(ok))).pools[0].ledger.VaultID, V);
+});
+await t("1 gate checks the currency code on every network", () => {
+  assert(!S.networkGate("devnet", ALL_ON, { ...DUSD, currency: "USD" }).ok); assert(S.networkGate("devnet", ALL_ON, DUSD).ok);
+  assert(S.networkGate("mainnet", ALL_ON, DUSD).reasons.some((r) => /must be RLUSD/.test(r))); assert(S.networkGate("testnet", ALL_ON, DUSD).reasons.some((r) => /must be RLUSD/.test(r)));
+  assert(!S.networkGate("testnet", ALL_ON).reasons.some((r) => /must be RLUSD/.test(r)), "shipped testnet asset is RLUSD");
+});
+// Lend page: the connected lender's real share balance
+const shareFetch = (mpt) => { const calls = []; return { calls, f: async (url, o) => { const b = JSON.parse(o.body), q = b.params[0]; calls.push([url, q]);
+  if (q.index) return { ok: true, json: async () => ({ result: { status: "success", node: { LedgerEntryType: "Vault", index: V, ShareMPTID: "0".repeat(8) + "E".repeat(40) } } }) };
+  if (mpt === null) return { ok: true, json: async () => ({ result: { status: "error", error: "entryNotFound" } }) };
+  return { ok: true, json: async () => ({ result: { status: "success", node: { LedgerEntryType: "MPToken", MPTAmount: mpt } } }) }; } }; };
+await t("lend share: reads Vault.ShareMPTID then the lender's MPToken on that network; no holding -> 0", async () => {
+  const m = shareFetch("1500"); const r = await L.vaultShareBalance("devnet", BW, V, m.f); assert.equal(r.amount, 1500); assert.equal(r.shareId, "0".repeat(8) + "E".repeat(40));
+  assert.deepEqual(m.calls[1][1].mptoken, { mpt_issuance_id: r.shareId, account: BW }); assert(m.calls.every(([u]) => u === NETWORKS.devnet.rpc));
+  assert.equal((await L.vaultShareBalance("devnet", BW, V, shareFetch(null).f)).amount, 0); assert.equal((await L.vaultShareBalance("devnet", BW, V, shareFetch("0").f)).amount, 0);
+  await assert.rejects(L.vaultShareBalance("devnet", "<x>", V, shareFetch("1").f), /bad account/); await assert.rejects(L.vaultShareBalance("devnet", BW, "nothex", shareFetch("1").f), /bad ledger id/);
+});
+await t("lend share column: 'none' when disconnected, no vault or no holding; real balance otherwise; no static placeholder text", () => {
+  const fn = MAIN.slice(MAIN.indexOf("function shareText"), MAIN.indexOf("function loadAccess"));
+  assert(/if \(!w\.account \|\| w\.mode !== "xaman" \|\| !p\.ledger\.VaultID\) return "none"/.test(fn)); assert(/r\.amount > 0 \? .* : "none"/.test(fn));
+  assert(/\$\{shareText\(p\)\}/.test(LEND) && /st\.pools\.forEach\(loadShare\)/.test(LEND)); assert(!/read from the ledger \(MPToken of the vault's ShareMPTID\)/.test(MAIN));
 });
 
 // Security

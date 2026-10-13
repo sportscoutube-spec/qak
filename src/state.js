@@ -2,7 +2,7 @@
 //  1. Ledger math that mirrors XLS-65/66 checks (pure functions; formulas cited per spec section).
 //  2. Off-ledger app state: borrower applications (gated by lifetime access read from the ledger) and an optional borrower label next to the ledger ids.
 // Nothing here submits a transaction.
-import { RULES as R, LIMITS as L, SPEC, AMENDMENTS, NETWORKS, FIRST_POOL, RIPPLE_EPOCH, ESCROW as E, FLAGS, ACCESS, QAK_ISSUER, QAK_CURRENCY } from "./config.js";
+import { RULES as R, LIMITS as L, SPEC, AMENDMENTS, NETWORKS, FIRST_POOL, RIPPLE_EPOCH, ESCROW as E, FLAGS, ACCESS, QAK_ISSUER, QAK_CURRENCY, RLUSD_CURRENCY, DEVNET_TEST_CURRENCY } from "./config.js";
 const req = (c, m) => { if (!c) throw new Error(m); };
 const DAY = 86400;
 export const nowRipple = (ms = Date.now()) => Math.floor(ms / 1000) - RIPPLE_EPOCH;
@@ -397,7 +397,10 @@ export function networkGate(net, features, asset) {
   if (!n.vaultLending) reasons.push(n.offReason);
   if (!features) reasons.push(`${n.label}: amendment status not checked yet.`);
   else for (const a of AMENDMENTS.required) if (features[a] !== true) reasons.push(`${n.label}: ${a} is not enabled.`);
-  const iss = (asset || n.asset).issuer;
+  const a = { ...n.asset, ...(asset || {}) }, iss = a.issuer; // an override that omits the currency keeps the network's own
+  // Currency code per network: devnet lends only the DUSD test token (RLUSD does not exist there); mainnet/testnet lend only RLUSD.
+  const want = net === "devnet" ? DEVNET_TEST_CURRENCY : RLUSD_CURRENCY;
+  if (a.currency !== want) reasons.push(net === "devnet" ? "Devnet: the lent asset must be the DUSD test token, not RLUSD or any other currency." : `${n.label}: the lent asset must be RLUSD.`);
   if (!iss) reasons.push(net === "devnet" ? "Devnet: no test-issuer set. RLUSD does not exist on devnet; set VITE_DEVNET_TEST_ISSUER to a self-issued test IOU issuer." : `${n.label}: no asset issuer set.`);
   return { ok: reasons.length === 0, reasons };
 }
@@ -463,10 +466,23 @@ export function apply(s, f) {
 
 const pool = (s, id) => { const p = s.pools.find((x) => x.id === id); req(p, "no pool"); return p; };
 // Record ledger ids after a validated transaction. One borrower per vault: a pool's VaultID, LoanBrokerID and LoanID are set once.
-export function recordLedger(s, id, field, value) {
-  const p = pool(s, id); req(["VaultID", "LoanBrokerID", "LoanID", "ShareMPTID", "SubscriptionDate", "RedemptionDate", "ManagementFeeRate"].includes(field), "bad field");
+// Shape of each stored ledger value. A VaultID is stored only with the Vault entry read back by ledger_entry (opts.entry).
+const LEDGER_OK = { VaultID: (x) => isId(x) && x !== null, LoanBrokerID: (x) => isId(x) && x !== null, LoanID: (x) => isId(x) && x !== null,
+  ShareMPTID: (x) => typeof x === "string" && /^[0-9A-F]{48}$/.test(x), SubscriptionDate: (x) => isTime(x) && x !== null, RedemptionDate: (x) => isTime(x) && x !== null,
+  ManagementFeeRate: (x) => x === R.FEE_RATE };
+// ledger_entry check for a VaultID: the node must be a Vault whose index is that id (and, when given, on the pool's network asset).
+export function confirmVaultEntry(id, node) {
+  req(typeof id === "string" && /^[0-9A-F]{64}$/.test(id), "VaultID must be 64 uppercase hex characters");
+  req(node && node.LedgerEntryType === "Vault", "ledger_entry did not return a Vault for this VaultID");
+  req(node.index === undefined || String(node.index).toUpperCase() === id, "ledger_entry returned a different Vault");
+  return true;
+}
+export function recordLedger(s, id, field, value, opts = {}) {
+  const p = pool(s, id); req(Object.hasOwn(LEDGER_OK, field), "bad field");
+  req(LEDGER_OK[field](value), `${field}: not a valid ledger value; ignored`);
   req(p.ledger[field] == null, `${field} already set for this borrower`);
   if (field === "VaultID") req(!s.pools.some((q) => q.ledger.VaultID === value), "this vault already belongs to another borrower");
+  if (field === "VaultID") confirmVaultEntry(value, opts.entry);
   p.ledger[field] = value; p.log.push(`${field} = ${value}`); return p;
 }
 
@@ -500,9 +516,14 @@ function okPool(p) {
     && p.escrow.records.every((r) => r && isAccount(r.owner) && Number.isInteger(r.seq) && r.seq > 0 && (r.hash === null || isId(r.hash)));
 }
 const KEEP = ["id", "label", "sample", "network", "capRlusd", "terms", "plan", "account", "log", "ledger", "escrow"];
+// A bad stored ledger id is ignored (set to null), never a reason to drop the whole pool.
+const cleanLedger = (p) => { if (!p || typeof p !== "object" || !p.ledger || typeof p.ledger !== "object") return p;
+  const lg = { ...p.ledger }; for (const k of Object.keys(LEDGER_OK)) if (lg[k] != null && !LEDGER_OK[k](lg[k])) lg[k] = null;
+  if (lg.VaultID === null) for (const k of ["ShareMPTID", "SubscriptionDate", "RedemptionDate"]) lg[k] = null;
+  for (const k of Object.keys(LEDGER_OK)) if (!(k in lg)) lg[k] = null; return { ...p, ledger: lg }; };
 export function sanitizeState(raw) {
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.pools)) return null;
-  const pools = raw.pools.filter(okPool).map((p) => Object.fromEntries(KEEP.map((k) => [k, p[k] ?? (k === "label" || k === "account" ? null : p[k])])));
+  const pools = raw.pools.map(cleanLedger).filter(okPool).map((p) => Object.fromEntries(KEEP.map((k) => [k, p[k] ?? (k === "label" || k === "account" ? null : p[k])])));
   const ids = new Set(), vaults = new Set();
   const uniq = pools.filter((p) => { if (ids.has(p.id)) return false; if (p.ledger.VaultID && vaults.has(p.ledger.VaultID)) return false; ids.add(p.id); if (p.ledger.VaultID) vaults.add(p.ledger.VaultID); return true; });
   return { pools: uniq };
