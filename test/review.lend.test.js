@@ -32,10 +32,10 @@ await t("lend page: default path, four steps done/stuck, leftover rule and trust
     "less than one installment, or still with the broker once the loan is defaulted or closed", "pro rata to their vault MPT shares at the default", "outside the vault and the loan",
     "the ledger does not enforce it", "otherwise the amount stays recorded as owed"]) assert(LEND.includes(s), s);
 });
-await t("risk lines: clawback, no on-chain collateral, no ledger liquidation, not audited; footer has 'not audited' and 'Not an offer'", () => {
-  const risks = MAIN.slice(MAIN.indexOf("const risks"), MAIN.indexOf("</ul>", MAIN.indexOf("const risks")));
-  assert(/claw back|clawback/i.test(risks) && /No on-chain collateral inside the loan/.test(risks) && /No liquidation/.test(risks)); assert(/\$\{risks\}/.test(LEND));
-  assert(/The code is not audited\./.test(HTML) && /Not an offer\./.test(HTML));
+// Changed 2026-10-13: the Home and Lend risk cards were removed by the user; only the global footer is checked now.
+await t("footer: 'The code is not audited.' and 'Not an offer.' (risk cards removed from Home and Lend)", () => {
+  assert(/<footer id="site-footer">Duck Bank · The code is not audited\. · Not an offer\.<\/footer>/.test(HTML));
+  assert(!/<h3>Risks<\/h3>/.test(MAIN) && !/const risks/.test(MAIN));
 });
 
 // 1. Network asset per network

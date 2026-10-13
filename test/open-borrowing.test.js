@@ -54,7 +54,7 @@ await t("UI: apply page has the access check and an optional label; no shop name
     assert(!re.test(m), `main.js still has ${re}`);
   assert(/name="label"/.test(m) && /Borrower label \(optional/.test(m)); assert(/Lifetime access/.test(m) && /ACCESS\.ADDRESS/.test(m) && /ACCESS\.FEE_QAK/.test(m));
   assert(/XRP collateral: an XRP escrow held beside the loan/.test(m)); assert(/XLS-66 does not take this XRP as collateral/.test(m));
-  assert(/clawback/i.test(m) && /No on-chain collateral inside the loan/.test(m) && /No liquidation/.test(m));
+  // Changed 2026-10-13: risk cards removed by the user; the clawback / no-collateral / no-liquidation lines are no longer on app pages. Footer only.
   assert(/The code is not audited/.test(src("../index.html")), "footer kept");
 });
 await t("structure: one borrower = one vault + one broker + one loan; DebtMaximum = AssetsMaximum = the borrower's cap", () => {
