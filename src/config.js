@@ -101,25 +101,26 @@ export const FLAGS = {
 // Duck Bank rules (app rules unless marked otherwise).
 export const RULES = {
   TOTAL_SUPPLY_QAK: 1_000_000_000,
-  LISTING_LOCK_QAK: 250_000,          // app rule: QAK locked to list a shop (an app lock, not CoverAvailable)
-  FEE_RATE: 1000,                     // ManagementFeeRate 1000 = 1.00% of interest (fixed at LoanBrokerSet)
-  FEE_RATE_DISCOUNT: 750,             // ManagementFeeRate 750 = 0.75%, chosen at broker creation if the shop holds >= DISCOUNT_MIN_HOLDING_QAK
-  DISCOUNT_MIN_HOLDING_QAK: 100_000,
-  LIST_VOTE_THRESHOLD_QAK: 1000,      // app rule: one QAK = one vote; listing passes at >= 1,000 yes and yes > no
-  MAX_CAP_RLUSD: 10_000,              // AssetsMaximum and DebtMaximum of a shop vault/broker
+  FEE_RATE: 1000,                     // ManagementFeeRate 1000 = 1.00% of interest (fixed at LoanBrokerSet; one rate for every borrower)
+  MAX_CAP_RLUSD: 10_000,              // AssetsMaximum and DebtMaximum of a borrower's vault/broker
   COVER_RATE_MINIMUM: 15000,          // 15%: RLUSD cover required before LoanSet, as a share of DebtTotal (incl. interest)
   COVER_RATE_LIQUIDATION: 100000,     // 100%: up to the whole minimum cover is taken on default
   VAULT_SCALE: 6,                     // Scale for the RLUSD (IOU) vault; spec range 0..18, default 6
   SHARE_NON_TRANSFERABLE: true,       // VaultCreate with tfVaultShareNonTransferable: the vault MPT share can only be redeemed
   ROUNDING_MARGIN: 0.01,              // app rule: RLUSD kept back from the max principal for ledger rounding
 };
+// Lifetime access (app rule): one validated QAK Payment of at least FEE_QAK from the borrower's account to ADDRESS, read on mainnet
+// (QAK exists only there). Checked from the ledger by delivered_amount (never Amount: a partial payment can deliver less). Per account,
+// once, for life. Frozen: page script, URL, localStorage or env cannot change the address or the fee.
+export const ACCESS = Object.freeze({ FEE_QAK: 1_000_000, ADDRESS: "rpRVzQSeZxxakWryRuTchxGQN7cs5oPi52", MEMO_TYPE: "duckbank/access", NETWORK: "mainnet",
+  MAX_TXS: 20_000 }); // account_tx paging cap per check
 // XRP escrow beside each XLS-66 loan (app rules; the ledger objects are XLS-65/66 + Escrow/AMM/DEX, unchanged).
 // XLS-66 does not take this XRP as collateral and does not sell it. The broker's bot sells it, after LoanManage, as an app step.
 // Escrow rules from xrpl.org (EscrowCreate/EscrowFinish/EscrowCancel): a Condition is PREIMAGE-SHA-256 only; a conditional escrow
 // must have CancelAfter; FinishAfter/CancelAfter are immutable; there is no transaction that adds XRP to an existing escrow.
 const H = 3600;
 export const ESCROW = {
-  ADD_LINE_PCT: 150,                   // brief: under this the shop gets the add window
+  ADD_LINE_PCT: 150,                   // brief: under this the borrower gets the add window
   DEFAULT_LINE_PCT: 120,               // brief: window expired under this = the bot runs (after LoanManage)
   ADD_WINDOW_SECONDS: 72 * H,          // FLAG app rule (product choice): 72 h to add a second escrow or LoanPay down the balance
   SALE_WINDOW_SECONDS: 3 * 86400,      // FLAG app rule: time the bot has after the mark for steps 2-4 before LoanManage default of the rest
@@ -130,9 +131,7 @@ export const ESCROW = {
   SELL_MAX_SLIPPAGE_PCT: 3,            // app rule: the bot's OfferCreate limit price is the quote minus 3%
   QUOTE_CHUNKS: 400,                   // resolution of the combined AMM + order book walk
 };
-// A shop with no XRP lists on the RLUSD-cover path only: small cap plus a file kept on the desk (off-ledger).
-export const NO_XRP = { MAX_CAP_RLUSD: 1_000 }; // FLAG app rule: cover-only cap
-export const PATHS = { escrow: "xrp-escrow", cover: "cover-only" };
+// Every loan needs the XRP escrow beside it (there is no cover-only path).
 // Read-only market used for the live ratio. mainnet-view pools read XRP/RLUSD on mainnet; devnet pools read XRP/DUSD on devnet.
 export const MARKETS = {
   mainnet: { label: "XRP/RLUSD on mainnet (read-only)", rpc: "https://xrplcluster.com/", quote: { currency: RLUSD_CURRENCY, issuer: "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De" }, unit: "RLUSD" },
@@ -141,15 +140,16 @@ export const MARKETS = {
 };
 // Input bounds for applications (app rules).
 export const LIMITS = { RATE_MIN_PCT: 0, RATE_MAX_PCT: 36, PAYMENTS_MIN: 1, PAYMENTS_MAX: 12, INTERVAL_MIN_DAYS: 1, INTERVAL_MAX_DAYS: 90,
-  TERM_MAX_DAYS: 180, NAME_MAX: 60, LOG_MAX: 300 };
+  TERM_MAX_DAYS: 180, LABEL_MAX: 60, LOG_MAX: 300 };
 const DAY = 86400;
-// The first pool: one shop, one closed-ended vault, one broker, one loan. No ledger objects exist yet, so every id is null.
+// Structure: one borrower = one closed-ended vault + one loan broker + one loan (XLS-65/66 objects per borrower), so a default is
+// written down only on that borrower's vault and DebtMaximum / cover apply to that one loan. The sample pool: no ledger objects yet.
 export const FIRST_POOL = {
-  id: "first", shop: "Kostas Bakery", city: "Athens", purpose: "stock", sample: true, network: "devnet", stage: "applied",
+  id: "first", label: "Sample borrower", sample: true, network: "devnet",
   capRlusd: RULES.MAX_CAP_RLUSD,
   terms: { InterestRate: 10000, PaymentTotal: 3, PaymentInterval: 30 * DAY, GracePeriod: 7 * DAY }, // 10% APR, 3 x 30 days, 7-day grace
   // Investment window = term 90 d + grace 7 d + sale window 3 d + LoanSet slack 3 d (app rule), so default handling ends before RedemptionDate.
-  plan: { subscriptionDays: 14, investmentDays: 103 }, path: "xrp-escrow",
+  plan: { subscriptionDays: 14, investmentDays: 103 },
 };
 export const TOKENOMICS = {
   venue: "FirstLedger", mint: "Q4 2026", supply: 1_000_000_000,

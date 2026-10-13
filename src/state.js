@@ -1,8 +1,8 @@
 // Duck Bank model. Two layers:
 //  1. Ledger math that mirrors XLS-65/66 checks (pure functions; formulas cited per spec section).
-//  2. Off-ledger app state: applications, QAK votes, the QAK-ordered queue and shop name/city/purpose next to the ledger ids.
+//  2. Off-ledger app state: borrower applications (gated by lifetime access read from the ledger) and an optional borrower label next to the ledger ids.
 // Nothing here submits a transaction.
-import { RULES as R, LIMITS as L, SPEC, AMENDMENTS, NETWORKS, FIRST_POOL, RIPPLE_EPOCH, ESCROW as E, NO_XRP, PATHS, FLAGS } from "./config.js";
+import { RULES as R, LIMITS as L, SPEC, AMENDMENTS, NETWORKS, FIRST_POOL, RIPPLE_EPOCH, ESCROW as E, FLAGS, ACCESS, QAK_ISSUER, QAK_CURRENCY } from "./config.js";
 const req = (c, m) => { if (!c) throw new Error(m); };
 const DAY = 86400;
 export const nowRipple = (ms = Date.now()) => Math.floor(ms / 1000) - RIPPLE_EPOCH;
@@ -78,7 +78,7 @@ export function loanMath(principal, t, managementFeeRate) {
 // InterestDue per unit of principal (linear in principal).
 export const interestFactor = (t, fee) => loanMath(1, t, fee).interestDue;
 // Fee rate used for cap math before the broker exists: the lower fee gives the higher InterestDue, so the bound is conservative.
-export const capMathFeeRate = (pool) => pool?.ledger?.ManagementFeeRate ?? R.FEE_RATE_DISCOUNT;
+export const capMathFeeRate = (pool) => pool?.ledger?.ManagementFeeRate ?? R.FEE_RATE;
 
 // Max principal under AssetsMaximum and DebtMaximum (XLS-66 §3.8.5.2 #6, #13, #14, #19). `s` is the live (or planned) vault/broker state.
 // #6  AssetsMaximum != 0 and AssetsTotal >= AssetsMaximum -> tecLIMIT_EXCEEDED
@@ -165,7 +165,7 @@ export const investmentDaysFor = (t, w = E) => Math.ceil((loanMaturitySpan(t) + 
 export const appLoanSetDeadline = (v, t, w = E) => v.RedemptionDate - loanMaturitySpan(t) - t.GracePeriod - w.SALE_WINDOW_SECONDS;
 // Escrow times for a pool (ledger-checked fields; the values are app rules):
 //  CancelAfter = RedemptionDate + margin. With LoanSet by the app deadline, last due date + grace + sale window <= RedemptionDate < CancelAfter,
-//  so the shop cannot EscrowCancel before default handling ends. A shop that repays gets its XRP back only after CancelAfter (EscrowCancel).
+//  so the borrower cannot EscrowCancel before default handling ends. A borrower that repays gets its XRP back only after CancelAfter (EscrowCancel).
 //  FinishAfter = SubscriptionDate + PaymentInterval: no loan can have a payment overdue earlier (LoanSet only after SubscriptionDate), so the
 //  ledger refuses any EscrowFinish before it. Set only while it is still in the future (no past times in EscrowCreate); omitted for later escrows.
 // CancelAfter = RedemptionDate + GracePeriod + buffer: the last payment can fall due at RedemptionDate at the latest, default comes only after
@@ -180,7 +180,7 @@ export function escrowTimes(v, t, now, w = E) {
 export function checkEscrow(node, exp) {
   if (!node || node.LedgerEntryType !== "Escrow") return { ok: false, drops: 0, problems: ["not found on the ledger (finished, canceled or never created)"] };
   const p = [], drops = typeof node.Amount === "string" && /^\d+$/.test(node.Amount) ? Number(node.Amount) : 0;
-  if (node.Account !== exp.owner) p.push(`owner ${node.Account} is not the shop ${exp.owner}`);
+  if (node.Account !== exp.owner) p.push(`owner ${node.Account} is not the borrower ${exp.owner}`);
   if (node.Destination !== exp.destination) p.push(`destination ${node.Destination} is not the broker ${exp.destination}`);
   if (String(node.Condition || "").toUpperCase() !== String(exp.condition || "").toUpperCase()) p.push("Condition does not match the broker's published condition");
   if (!(drops > 0)) p.push("Amount is not XRP");
@@ -264,7 +264,7 @@ export function marginState({ ratio, belowAddSince, now, windowSec = E.ADD_WINDO
   if (ratio == null || Number.isNaN(ratio)) return { state: "no-ratio", label: "no live ratio (no market or no escrow)" };
   if (ratio >= add) return { state: "ok", label: `at or above the ${add}% add line` };
   const since = belowAddSince ?? now, endsAt = since + windowSec;
-  if (now < endsAt) return { state: "add-window", since, endsAt, label: `under the ${add}% add line: the shop can add a second escrow or LoanPay the balance down until the window ends` };
+  if (now < endsAt) return { state: "add-window", since, endsAt, label: `under the ${add}% add line: the borrower can add a second escrow or LoanPay the balance down until the window ends` };
   if (ratio < def) return { state: "bot-armed", since, endsAt, label: `window over and under the ${def}% default line: the bot runs, starting with LoanManage` };
   return { state: "below-add", since, endsAt, label: `window over, between the ${def}% and ${add}% lines: no bot; it runs if the ratio falls under ${def}%` };
 }
@@ -292,8 +292,8 @@ export function saleSteps({ loan = null, marked = null, escrows = [], sales = []
   const s1 = marked ? S("done", "LoanManage marked the loan", [marked.hash]) : overdue ? S("stuck", "a payment is overdue and LoanManage tfLoanImpair has not been sent") : S("not started", "no payment overdue; nothing to mark");
   let s2;
   if (!marked) s2 = S("not started", "waits for step 1");
-  else if (!escrows.length) s2 = S("stuck", "no XRP escrow on record for this shop");
-  else if (canc.length) s2 = S("stuck", `${canc.length} escrow(s) canceled after CancelAfter: that XRP went back to the shop`);
+  else if (!escrows.length) s2 = S("stuck", "no XRP escrow on record for this borrower");
+  else if (canc.length) s2 = S("stuck", `${canc.length} escrow(s) canceled after CancelAfter: that XRP went back to the borrower`);
   else if (!pres.length) s2 = S("done", `${fin.length} escrow(s) finished, ${finDrops / DROPS} XRP to the broker`, fin.map((e) => e.finishHash).filter(Boolean));
   else s2 = S(late ? "stuck" : "waiting", `${pres.length} of ${escrows.length} escrow(s) still open${late ? " after the sale window" : ""}`);
   let s3;
@@ -307,12 +307,12 @@ export function saleSteps({ loan = null, marked = null, escrows = [], sales = []
   else if (paid > 0) s4 = S(defaulted ? "done" : "waiting", `LoanPay ${+paid.toFixed(6)} after the mark${defaulted ? "; the rest was defaulted" : "; LoanManage default of the rest when the ledger allows it"}`, pays.map((x) => x.hash));
   else if (defaulted) s4 = S("stuck", "loan defaulted with no LoanPay from the proceeds", [defaulted.hash]);
   else if (nextDue != null && proceeds < nextDue) s4 = S("stuck", `proceeds ${+proceeds.toFixed(6)} are below one installment (${+nextDue.toFixed(6)}); LoanPay takes no partial payment`);
-  else s4 = S(late ? "stuck" : "waiting", "waiting for the shop's signed LoanPay (XLS-66 accepts LoanPay only from Loan.Borrower)");
+  else s4 = S(late ? "stuck" : "waiting", "waiting for the borrower's signed LoanPay (XLS-66 accepts LoanPay only from Loan.Borrower)");
   const leftover = Math.max(0, proceeds - paid);
   // XLS-56 Batch: finishes, the sale and the Payment to the shop that ran as inner txs of one outer Batch (ALLORNOTHING in the bot).
   const batches = saleBatches({ escrows: fin, sales, shopPays });
   s2.batches = batches.filter((b) => b.finishes.length); s3.batches = batches.filter((b) => b.sales.length);
-  if (s3.batches.length) s3.detail += `; atomic with the escrow finish${s3.batches.some((b) => b.shopPays.length) ? " and the Payment to the shop" : ""} via XLS-56 Batch (ALLORNOTHING)`;
+  if (s3.batches.length) s3.detail += `; atomic with the escrow finish${s3.batches.some((b) => b.shopPays.length) ? " and the Payment to the borrower" : ""} via XLS-56 Batch (ALLORNOTHING)`;
   return { steps: [["Mark the loan (LoanManage)", s1], ["Finish every escrow (EscrowFinish + fulfillment)", s2], ["Sell the XRP (OfferCreate on the DEX/AMM)", s3], ["LoanPay up to what is owed", s4]].map(([name, st], i) => ({ n: i + 1, name, batches: [], ...st })),
     batches, shopFunded: shopPays.reduce((t, x) => t + x.quote, 0), proceeds, paid, undelivered: leftover, leftover, leftoverFixed: leftoverFixed({ loan, defaulted }), shortfall: defaulted ? defaulted.vaultLoss : null };
 }
@@ -378,16 +378,11 @@ export function leftoverStatus(split, { paid = [], lines = {}, self = null } = {
 // The leftover is fixed only once the loan is defaulted or settled (or deleted); before that it may still go into a LoanPay.
 export const leftoverFixed = ({ loan, defaulted }) => !!defaulted || !loan || loan.PaymentRemaining === 0;
 
-// LoanSet gate for the escrow path (app rule: the ledger's LoanSet knows nothing of the escrow). Cover-only path: small cap + desk file.
+// LoanSet gate (app rule: the ledger's LoanSet knows nothing of the escrow). Every loan needs the XRP escrow beside it.
 export function loanSetEscrowGate(pool, ev = {}) {
   const r = [];
-  if (pool.path === PATHS.cover) {
-    if (pool.capRlusd > NO_XRP.MAX_CAP_RLUSD) r.push(`Cover-only path: cap must be at most ${NO_XRP.MAX_CAP_RLUSD.toLocaleString("en-US")} RLUSD.`);
-    if (!pool.deskFile) r.push("Cover-only path: the desk file (off-ledger) is not on record.");
-    return { ok: r.length === 0, reasons: r };
-  }
   if (!isCondition(pool.escrow?.condition)) r.push("The broker has not published the escrow Condition yet.");
-  if (!ev.escrows || ev.escrows.verified === 0) r.push("LoanSet stays blocked until the shop's XRP escrow to the broker is found on the ledger by owner + sequence, with the right destination, Condition, XRP amount and CancelAfter.");
+  if (!ev.escrows || ev.escrows.verified === 0) r.push("LoanSet stays blocked until the borrower's XRP escrow to the broker is found on the ledger by owner + sequence, with the right destination, Condition, XRP amount and CancelAfter.");
   else if (ev.noMarket) r.push("No market to value the escrowed XRP, so the opening ratio cannot be checked.");
   else if (!(ev.ratio >= E.ADD_LINE_PCT)) r.push(`Opening ratio ${Number.isFinite(ev.ratio) ? ev.ratio.toFixed(1) + "%" : "unknown"} is under the ${E.ADD_LINE_PCT}% add line (app rule): add a second escrow before LoanSet.`);
   if (ev.vault && ev.now != null && ev.now > appLoanSetDeadline(ev.vault, pool.terms, ev.windows || E)) r.push("Past the app LoanSet deadline (RedemptionDate − term − grace − sale window): default handling would not fit before RedemptionDate.");
@@ -407,36 +402,49 @@ export function networkGate(net, features, asset) {
   return { ok: reasons.length === 0, reasons };
 }
 
-// ---------- QAK app rules ----------
-// Fee cut: ManagementFeeRate is fixed at LoanBrokerSet, so the QAK balance check happens once, at broker creation.
-export const feeRateAtBrokerCreation = (ledgerQak) => ((Number(ledgerQak) || 0) >= R.DISCOUNT_MIN_HOLDING_QAK ? R.FEE_RATE_DISCOUNT : R.FEE_RATE);
-export const feePct = (rate) => (rate / 1000).toFixed(2); // 1000 (1/10 bps) = 1.00%
+export const feePct = (rate) => (rate / 1000).toFixed(2); // ManagementFeeRate in 1/10 bps: 1000 = 1.00% of interest
+
+// ---------- Lifetime access (QAK app rule) ----------
+// One validated Payment from `account` to ACCESS.ADDRESS that delivered at least ACCESS.FEE_QAK QAK of the QAK issuer. Read from
+// account_tx rows ({tx, meta, validated}); delivered_amount decides (a partial payment can deliver less than Amount). The memo is
+// what the app's own payload carries; the check does not require it, because the payment itself is the fee.
+export const isAccessPayment = (row, account) => {
+  const tx = row?.tx || {}, meta = row?.meta || {}, d = meta.delivered_amount ?? meta.DeliveredAmount;
+  return row?.validated !== false && tx.TransactionType === "Payment" && tx.Account === account && tx.Destination === ACCESS.ADDRESS
+    && meta.TransactionResult === "tesSUCCESS" && !!d && typeof d === "object" && d.currency === QAK_CURRENCY && d.issuer === QAK_ISSUER
+    && Number(d.value) >= ACCESS.FEE_QAK;
+};
+export function accessFrom(rows, account) {
+  const hit = (rows || []).find((r) => isAccessPayment(r, account));
+  return hit ? { ok: true, hash: hit.hash, ledger: hit.ledger, delivered: Number((hit.meta.delivered_amount ?? hit.meta.DeliveredAmount).value) }
+    : { ok: false, reason: `No validated payment of at least ${ACCESS.FEE_QAK.toLocaleString("en-US")} QAK from this account to ${ACCESS.ADDRESS} on mainnet.` };
+}
 
 // ---------- Off-ledger app state ----------
-export const STAGES = ["applied", "listed"]; // off-ledger stages; after "listed" the ledger objects define the state
+// One pool = one borrower (any XRPL account) with its own closed-ended vault, loan broker and loan. No votes, no listing stage:
+// the borrower's lifetime access is read from the ledger, and the ledger objects define the state after that.
 export const PREVIEW_ACCOUNT = "rPREVIEWxxxxxxxxxxxxxxxxxxxxxxxxx";
 export const isAccount = (who) => typeof who === "string" && (who === PREVIEW_ACCOUNT || /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(who));
 const reqAccount = (who) => req(isAccount(who), "connect a Xaman account first");
-const isQak = (x) => Number.isInteger(x) && x > 0 && x <= R.TOTAL_SUPPLY_QAK;
 const isId = (x) => x === null || (typeof x === "string" && /^[0-9A-F]{64}$/.test(x));
 const isTime = (x) => x === null || (Number.isInteger(x) && x > 0);
 const newId = () => "p_" + (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
-const cleanName = (v, label) => { const t = String(v ?? "").trim(); req(t.length > 0, `${label} required`); req(t.length <= L.NAME_MAX, `${label}: max ${L.NAME_MAX} characters`); return t; };
+const cleanLabel = (v) => { const t = String(v ?? "").trim(); req(t.length <= L.LABEL_MAX, `borrower label: max ${L.LABEL_MAX} characters`); return t || null; };
 const num = (v, label) => { req(v !== undefined && v !== null && String(v).trim() !== "", `${label} required`); const x = Number(v); req(Number.isFinite(x), `${label} must be a number`); return x; };
 const blankLedger = () => ({ VaultID: null, LoanBrokerID: null, LoanID: null, ShareMPTID: null, SubscriptionDate: null, RedemptionDate: null, ManagementFeeRate: null });
-const base = () => ({ votes: { yes: 0, no: 0 }, capVotes: {}, voters: [], log: [], ledger: blankLedger(), escrow: { condition: null, records: [] } });
+const base = () => ({ log: [], ledger: blankLedger(), escrow: { condition: null, records: [] } });
 
 export function seed() {
   const f = FIRST_POOL;
-  return { pools: [{ ...base(), id: f.id, shop: f.shop, city: f.city, purpose: f.purpose, sample: true, network: f.network, stage: f.stage,
-    capRlusd: f.capRlusd, terms: { ...f.terms }, plan: { ...f.plan }, path: f.path, deskFile: null, account: null,
-    listingLock: { who: null, qak: R.LISTING_LOCK_QAK }, shopHoldingQak: null, holdingVerified: false }], queue: [] };
+  return { pools: [{ ...base(), id: f.id, label: f.label, sample: true, network: f.network, capRlusd: f.capRlusd, terms: { ...f.terms }, plan: { ...f.plan }, account: null }] };
 }
 
-// Application (off-ledger). The cap becomes AssetsMaximum and DebtMaximum; the terms become LoanSet fields.
+// Application (off-ledger). Any account with lifetime access can apply; the cap becomes AssetsMaximum and DebtMaximum, the terms
+// become LoanSet fields. `access` = the ledger check result (accessFrom); it is re-checked live before any transaction.
 export function apply(s, f) {
-  reqAccount(f.account); const shop = cleanName(f.shop, "shop name"), city = cleanName(f.city, "city");
-  req(["stock", "fit-out"].includes(f.purpose), "purpose must be stock or fit-out");
+  reqAccount(f.account); req(f.account !== PREVIEW_ACCOUNT, "a mock wallet has no ledger history: lifetime access needs a real account");
+  req(f.access && f.access.ok === true, `lifetime access not found on the ledger: pay ${ACCESS.FEE_QAK.toLocaleString("en-US")} QAK to ${ACCESS.ADDRESS} first`);
+  const label = cleanLabel(f.label);
   const cap = num(f.capRlusd, "cap"); req(Number.isInteger(cap) && cap >= 1 && cap <= R.MAX_CAP_RLUSD, `cap must be a whole number 1..${R.MAX_CAP_RLUSD.toLocaleString("en-US")} RLUSD`);
   const rate = num(f.ratePct, "interest rate"); req(rate >= L.RATE_MIN_PCT && rate <= L.RATE_MAX_PCT, `interest rate must be ${L.RATE_MIN_PCT}..${L.RATE_MAX_PCT}% APR`);
   const pt = num(f.paymentTotal, "number of payments"); req(Number.isInteger(pt) && pt >= L.PAYMENTS_MIN && pt <= L.PAYMENTS_MAX, `number of payments must be a whole number ${L.PAYMENTS_MIN}..${L.PAYMENTS_MAX}`);
@@ -444,94 +452,58 @@ export function apply(s, f) {
   req(pt * iv <= L.TERM_MAX_DAYS, `term (payments x interval) must be at most ${L.TERM_MAX_DAYS} days`);
   const gr = num(f.graceDays, "grace period"); req(Number.isInteger(gr) && gr >= 1, "grace period must be a whole number of days, at least 1");
   req(gr <= iv, "grace period must not exceed the payment interval (GracePeriod <= PaymentInterval)");
-  const path = f.path || PATHS.escrow; req(Object.values(PATHS).includes(path), "path must be xrp-escrow or cover-only");
-  let deskFile = null;
-  if (path === PATHS.cover) { req(cap <= NO_XRP.MAX_CAP_RLUSD, `a shop with no XRP lists on the cover-only path with a cap of at most ${NO_XRP.MAX_CAP_RLUSD.toLocaleString("en-US")} RLUSD`);
-    deskFile = String(f.deskFile ?? "").trim(); req(deskFile.length > 0, "cover-only path: describe the file the desk keeps on the shop (off-ledger)"); req(deskFile.length <= 120, "desk file note: max 120 characters"); }
-  const lock = num(f.listingLock, "listing lock"); req(isQak(lock), `QAK amounts must be whole numbers 1..${R.TOTAL_SUPPLY_QAK.toLocaleString("en-US")}`);
-  req(lock === R.LISTING_LOCK_QAK, `listing lock must be ${R.LISTING_LOCK_QAK.toLocaleString("en-US")} QAK`);
-  const held = Number(f.ledgerQak) || 0; req(held >= 0 && held <= R.TOTAL_SUPPLY_QAK, "bad ledger balance");
-  req(lock <= held, `listing lock (${lock.toLocaleString("en-US")} QAK) must be covered by your QAK balance (ledger): ${held.toLocaleString("en-US")} QAK`);
   const terms = { InterestRate: Math.round(rate * 1000), PaymentTotal: pt, PaymentInterval: iv * DAY, GracePeriod: gr * DAY };
   const errs = validateLoanTerms({ ...terms, PrincipalRequested: cap }); req(errs.length === 0, errs.join("; "));
   const plan = { subscriptionDays: FIRST_POOL.plan.subscriptionDays, investmentDays: investmentDaysFor(terms) }; // app rule: term + grace + sale window + LoanSet slack
   req(planFits(plan, terms), "loan term does not fit the investment window");
-  const p = { ...base(), id: newId(), shop, city, purpose: f.purpose, sample: false, network: "devnet", stage: "applied", capRlusd: cap, terms, plan, path, deskFile,
-    account: f.account, listingLock: { who: f.account, qak: lock }, shopHoldingQak: held, holdingVerified: f.ledgerVerified === true, log: ["applied by " + f.account] };
+  const p = { ...base(), id: newId(), label, sample: false, network: "devnet", capRlusd: cap, terms, plan, account: f.account,
+    log: [`applied by ${f.account} (lifetime access ${f.access.hash || "verified"})`] };
   s.pools.push(p); return p;
 }
 
-// Votes: one QAK = one vote, on the listing and the cap only (app rule, off-ledger).
 const pool = (s, id) => { const p = s.pools.find((x) => x.id === id); req(p, "no pool"); return p; };
-// One account, one vote, weighted by that account's QAK. `held` = its QAK balance read from the ledger: when given, the weight must
-// equal it (no claiming more than you hold). A second vote from the same account is refused.
-export function vote(s, id, yes, qak, who, held = null) {
-  reqAccount(who); const p = pool(s, id); req(p.stage === "applied", "voting only while applied"); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000");
-  if (held !== null) req(qak === Math.floor(Number(held)), "QAK weight must equal the account's QAK balance on the ledger");
-  req(!p.voters.some((v) => v.who === who && !v.cap), "this account has already voted on this listing");
-  p.votes[yes ? "yes" : "no"] += qak; p.voters.push({ who, yes: !!yes, qak });
-  if (p.votes.yes >= R.LIST_VOTE_THRESHOLD_QAK && p.votes.yes > p.votes.no) {
-    const best = Object.entries(p.capVotes).sort((a, b) => b[1] - a[1])[0]; if (best && best[1] > p.votes.yes) p.capRlusd = Number(best[0]);
-    p.stage = "listed"; p.log.push(`listed by QAK vote; cap ${p.capRlusd} RLUSD`); }
-  return p;
-}
-export function voteCap(s, id, cap, qak, who, held = null) {
-  reqAccount(who); qak = Number(qak); req(isQak(qak), "QAK weight must be a whole number 1..1,000,000,000"); const p = pool(s, id); req(p.stage === "applied", "cap votes only while applied");
-  if (held !== null) req(qak === Math.floor(Number(held)), "QAK weight must equal the account's QAK balance on the ledger");
-  req(!p.voters.some((v) => v.who === who && v.cap), "this account has already voted on the cap");
-  const maxCap = p.path === PATHS.cover ? NO_XRP.MAX_CAP_RLUSD : R.MAX_CAP_RLUSD;
-  cap = Number(cap); req(Number.isInteger(cap) && cap > 0 && cap <= maxCap, `cap vote must be 1..${maxCap}`); p.capVotes[cap] = (p.capVotes[cap] || 0) + qak; p.voters.push({ who, cap, qak }); return p;
-}
-// Queue: locked QAK orders the Duck Bank deposit queue (app rule). The vault itself is public: the ledger accepts any VaultDeposit during Subscription.
-export function enqueue(s, who, id, amt, qakLocked) {
-  reqAccount(who); const p = pool(s, id); amt = Number(amt); req(Number.isFinite(amt) && amt > 0 && amt <= p.capRlusd, `amount must be a finite number > 0 and at most the cap (${p.capRlusd})`);
-  const lock = qakLocked == null || qakLocked === "" ? 0 : Number(qakLocked); req(lock === 0 || isQak(lock), "QAK lock must be 0 or a whole number 1..1,000,000,000");
-  s.queue.push({ who, id, amt, qakLocked: lock }); s.queue.sort((a, b) => b.qakLocked - a.qakLocked); return s.queue;
-}
-// Record ledger ids after a validated transaction. One shop per vault: a pool's VaultID, LoanBrokerID and LoanID are set once.
+// Record ledger ids after a validated transaction. One borrower per vault: a pool's VaultID, LoanBrokerID and LoanID are set once.
 export function recordLedger(s, id, field, value) {
   const p = pool(s, id); req(["VaultID", "LoanBrokerID", "LoanID", "ShareMPTID", "SubscriptionDate", "RedemptionDate", "ManagementFeeRate"].includes(field), "bad field");
-  req(p.ledger[field] == null, `${field} already set for this shop`);
-  if (field === "VaultID") req(!s.pools.some((q) => q.ledger.VaultID === value), "this vault already belongs to another shop");
+  req(p.ledger[field] == null, `${field} already set for this borrower`);
+  if (field === "VaultID") req(!s.pools.some((q) => q.ledger.VaultID === value), "this vault already belongs to another borrower");
   p.ledger[field] = value; p.log.push(`${field} = ${value}`); return p;
 }
 
 // Off-ledger escrow records next to the ledger ids: the broker's published Condition (never the fulfillment) and escrow owner + sequence.
 export function recordCondition(s, id, hex) {
-  const p = pool(s, id); req(p.path === PATHS.escrow, "cover-only pools have no XRP escrow"); hex = String(hex || "").trim().toUpperCase();
+  const p = pool(s, id); hex = String(hex || "").trim().toUpperCase();
   req(isCondition(hex), "Condition must be a PREIMAGE-SHA-256 condition for a 32-byte preimage (A0258020…810120)");
-  req(!p.escrow.condition, "Condition already published for this shop"); p.escrow.condition = hex; p.log.push("escrow Condition published by the broker"); return p;
+  req(!p.escrow.condition, "Condition already published for this borrower"); p.escrow.condition = hex; p.log.push("escrow Condition published by the broker"); return p;
 }
 export function recordEscrow(s, id, { owner, seq, hash = null }) {
-  const p = pool(s, id); req(p.path === PATHS.escrow, "cover-only pools have no XRP escrow"); req(isAccount(owner) && owner !== PREVIEW_ACCOUNT, "escrow owner must be an XRPL account");
+  const p = pool(s, id); req(isAccount(owner) && owner !== PREVIEW_ACCOUNT, "escrow owner must be an XRPL account");
   seq = Number(seq); req(Number.isInteger(seq) && seq > 0, "escrow sequence must be a positive whole number"); req(hash === null || isId(hash), "bad tx hash");
-  req(!p.escrow.records.some((r) => r.owner === owner && r.seq === seq), "escrow already on record"); req(p.escrow.records.length < 20, "at most 20 escrows per shop");
+  req(!p.escrow.records.some((r) => r.owner === owner && r.seq === seq), "escrow already on record"); req(p.escrow.records.length < 20, "at most 20 escrows per borrower");
   p.escrow.records.push({ owner, seq, hash }); p.log.push(`escrow on record: ${owner} sequence ${seq}`); return p;
 }
 
-// Load-time validation of stored state (localStorage is untrusted). Bad pools are dropped.
+// Load-time validation of stored state (localStorage is untrusted). Bad pools are dropped; old shop-era fields (votes, listing lock,
+// queue, shop name/city/purpose, cover-only path) are not carried over.
 const okStr = (x, max) => typeof x === "string" && x.length <= max;
 const okNum = (x) => typeof x === "number" && Number.isFinite(x);
 function okPool(p) {
-  return p && typeof p === "object" && okStr(p.id, 64) && /^[A-Za-z0-9_-]+$/.test(p.id) && okStr(p.shop, L.NAME_MAX) && p.shop.trim() && okStr(p.city, L.NAME_MAX) && p.city.trim()
-    && ["stock", "fit-out"].includes(p.purpose) && STAGES.includes(p.stage) && Object.hasOwn(NETWORKS, p.network)
+  return p && typeof p === "object" && okStr(p.id, 64) && /^[A-Za-z0-9_-]+$/.test(p.id) && (p.label === null || p.label === undefined || okStr(p.label, L.LABEL_MAX))
+    && Object.hasOwn(NETWORKS, p.network) && (p.path === undefined || p.path === "xrp-escrow")
     && okNum(p.capRlusd) && p.capRlusd > 0 && p.capRlusd <= R.MAX_CAP_RLUSD
     && p.terms && validateLoanTerms({ ...p.terms, PrincipalRequested: 1 }).length === 0 && p.terms.InterestRate <= L.RATE_MAX_PCT * 1000
     && p.plan && Number.isInteger(p.plan.subscriptionDays) && p.plan.subscriptionDays > 0 && Number.isInteger(p.plan.investmentDays) && planFits(p.plan, p.terms)
     && p.ledger && ["VaultID", "LoanBrokerID", "LoanID"].every((k) => isId(p.ledger[k])) && (p.ledger.ShareMPTID === null || (typeof p.ledger.ShareMPTID === "string" && /^[0-9A-F]{48}$/.test(p.ledger.ShareMPTID)))
-    && isTime(p.ledger.SubscriptionDate) && isTime(p.ledger.RedemptionDate) && [null, R.FEE_RATE, R.FEE_RATE_DISCOUNT].includes(p.ledger.ManagementFeeRate)
-    && Array.isArray(p.log) && p.log.every((l) => okStr(l, L.LOG_MAX)) && p.listingLock && okNum(p.listingLock.qak) && p.votes && okNum(p.votes.yes) && okNum(p.votes.no)
-    && p.capVotes && typeof p.capVotes === "object" && (p.account === null || p.account === undefined || isAccount(p.account))
-    && (p.shopHoldingQak === null || p.shopHoldingQak === undefined || okNum(p.shopHoldingQak))
-    && Object.values(PATHS).includes(p.path) && (p.path !== PATHS.cover || (p.capRlusd <= NO_XRP.MAX_CAP_RLUSD && okStr(p.deskFile, 120) && p.deskFile.trim()))
+    && isTime(p.ledger.SubscriptionDate) && isTime(p.ledger.RedemptionDate) && [null, R.FEE_RATE].includes(p.ledger.ManagementFeeRate)
+    && Array.isArray(p.log) && p.log.every((l) => okStr(l, L.LOG_MAX)) && (p.account === null || p.account === undefined || isAccount(p.account))
     && p.escrow && (p.escrow.condition === null || isCondition(p.escrow.condition)) && Array.isArray(p.escrow.records) && p.escrow.records.length <= 20
     && p.escrow.records.every((r) => r && isAccount(r.owner) && Number.isInteger(r.seq) && r.seq > 0 && (r.hash === null || isId(r.hash)));
 }
+const KEEP = ["id", "label", "sample", "network", "capRlusd", "terms", "plan", "account", "log", "ledger", "escrow"];
 export function sanitizeState(raw) {
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.pools)) return null;
-  const pools = raw.pools.filter(okPool).map((p) => ({ ...p, holdingVerified: false, voters: Array.isArray(p.voters) ? p.voters.filter((v) => v && okStr(v.who, 64)) : [] }));
+  const pools = raw.pools.filter(okPool).map((p) => Object.fromEntries(KEEP.map((k) => [k, p[k] ?? (k === "label" || k === "account" ? null : p[k])])));
   const ids = new Set(), vaults = new Set();
   const uniq = pools.filter((p) => { if (ids.has(p.id)) return false; if (p.ledger.VaultID && vaults.has(p.ledger.VaultID)) return false; ids.add(p.id); if (p.ledger.VaultID) vaults.add(p.ledger.VaultID); return true; });
-  const queue = Array.isArray(raw.queue) ? raw.queue.filter((q) => q && okStr(q.who, 64) && okStr(q.id, 64) && okNum(q.amt) && q.amt > 0 && okNum(q.qakLocked) && q.qakLocked >= 0 && q.qakLocked <= R.TOTAL_SUPPLY_QAK) : [];
-  return { pools: uniq, queue };
+  return { pools: uniq };
 }

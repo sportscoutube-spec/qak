@@ -1,7 +1,7 @@
 // Review 2026-10-12: unit, flow, gate, regression and input tests. Pure functions only, no network.
-import assert from "node:assert";
+import assert from "node:assert"; import fs from "node:fs";
 import * as S from "../src/state.js"; import * as P from "../src/payloads.js";
-import { RULES as R, ESCROW as E, NO_XRP, PATHS, NETWORKS, AMENDMENTS, FIRST_POOL, FLAGS } from "../src/config.js";
+import { RULES as R, ESCROW as E, NETWORKS, AMENDMENTS, FIRST_POOL, FLAGS, ACCESS } from "../src/config.js";
 import { t, pending, xfail, done } from "./harness.js";
 const DAY = 86400, ID = "A".repeat(64), SHOP = "rBZaALm7orN4fVnYDmpE4treWZS4x4oQXG", BR = "rBRR9DokNwd2BWmXrNiA28rNRijVMyeTw8";
 const COND = "A0258020" + "CD".repeat(32) + "810120", T = FIRST_POOL.terms;
@@ -59,8 +59,8 @@ await t("subscription window open/closed: VaultDeposit gate (tecEXPIRED after Su
 });
 await t("investment window: ledger window open but app blocks LoanSet with no escrow", () => {
   const now = vault.SubscriptionDate + 1; assert(S.loanSetWindowGate(vault, T, now).ok);
-  const pool = { path: PATHS.escrow, escrow: { condition: COND }, terms: T };
-  const g = S.loanSetEscrowGate(pool, { escrows: { verified: 0 }, vault, now }); assert(!g.ok); assert(g.reasons.some((r) => /blocked until the shop's XRP escrow/.test(r)));
+  const pool = { escrow: { condition: COND }, terms: T };
+  const g = S.loanSetEscrowGate(pool, { escrows: { verified: 0 }, vault, now }); assert(!g.ok); assert(g.reasons.some((r) => /blocked until the borrower's XRP escrow/.test(r)));
   assert(!S.loanSetEscrowGate({ ...pool, escrow: { condition: null } }, { escrows: { verified: 1 }, ratio: 200, vault, now }).ok, "no published Condition");
   assert(!S.loanSetEscrowGate(pool, { escrows: { verified: 1 }, ratio: 149.9, vault, now }).ok, "under 150% at open");
   assert(S.loanSetEscrowGate(pool, { escrows: { verified: 1 }, ratio: 150, vault, now }).ok);
@@ -98,27 +98,26 @@ await t("mainnet hard-off is a frozen constant (fixed: deep Object.freeze in con
 });
 
 // ---------- 6. Regression ----------
-await t("cover-only shop does not require an escrow", () => {
-  const g = S.loanSetEscrowGate({ path: PATHS.cover, capRlusd: NO_XRP.MAX_CAP_RLUSD, deskFile: "file 12", terms: T }, {}); assert(g.ok, g.reasons.join());
-  assert(!S.loanSetEscrowGate({ path: PATHS.cover, capRlusd: NO_XRP.MAX_CAP_RLUSD + 1, deskFile: "x", terms: T }, {}).ok);
-  const s = S.seed(); const p = S.apply(s, { account: SHOP, shop: "Nikos", city: "Patra", purpose: "stock", capRlusd: "500", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", path: PATHS.cover, deskFile: "desk file", listingLock: "250000", ledgerQak: "300000" });
-  assert.throws(() => S.recordCondition(s, p.id, COND), /cover-only/); assert.throws(() => S.recordEscrow(s, p.id, { owner: SHOP, seq: 1 }), /cover-only/);
+await t("no cover-only path: a pool without an escrow never passes the LoanSet gate", () => {
+  const g = S.loanSetEscrowGate({ path: "cover-only", capRlusd: 1000, deskFile: "file 12", escrow: { condition: null, records: [] }, terms: T }, {}); assert(!g.ok);
+  const s = S.seed(); const p = S.apply(s, { account: SHOP, capRlusd: "500", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", access: { ok: true } });
+  S.recordCondition(s, p.id, COND); S.recordEscrow(s, p.id, { owner: SHOP, seq: 1 }); assert.equal(p.escrow.records.length, 1);
 });
-await t("QAK rules never build a tx moving RLUSD or XRP", () => {
-  const s = S.seed(); const p = S.apply(s, { account: SHOP, shop: "Nikos", city: "Patra", purpose: "stock", capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", listingLock: "250000", ledgerQak: "300000" });
-  const outs = [S.voteCap(s, p.id, 800, 10, BR), S.vote(s, p.id, true, 1000, BR), S.enqueue(s, BR, p.id, 50, 10), S.feeRateAtBrokerCreation(200000)];
-  const blob = JSON.stringify([s, outs]); assert(!/TransactionType|"Amount"|"Destination"/.test(blob));
-  assert.equal(S.feeRateAtBrokerCreation(100000), R.FEE_RATE_DISCOUNT); assert.equal(S.feeRateAtBrokerCreation(99999), R.FEE_RATE);
+await t("access rules never build a tx moving RLUSD or XRP; the access payload moves only QAK to the frozen address", () => {
+  const s = S.seed(); S.apply(s, { account: SHOP, capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", access: { ok: true } });
+  assert(!/TransactionType|"Amount"|"Destination"/.test(JSON.stringify(s)));
+  const pay = P.accessPayment({ account: SHOP }); assert.equal(pay.Destination, ACCESS.ADDRESS); assert.equal(pay.Amount.currency, "QAK"); assert.equal(pay.Amount.value, "1000000");
+  assert(Object.isFrozen(ACCESS)); assert.throws(() => { "use strict"; ACCESS.ADDRESS = BR; }); assert.equal(ACCESS.ADDRESS, "rpRVzQSeZxxakWryRuTchxGQN7cs5oPi52");
 });
 
 // ---------- Input sanitization (security check) ----------
-const base = { account: SHOP, shop: "X", city: "Y", purpose: "stock", capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", listingLock: "250000", ledgerQak: "300000" };
+const base = { account: SHOP, label: "X", capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", access: { ok: true } };
 await t("apply: NaN / negative / huge / fractional caps and rates are rejected", () => {
-  for (const [k, v] of [["capRlusd", "NaN"], ["capRlusd", "-5"], ["capRlusd", "1e9"], ["capRlusd", "10.5"], ["capRlusd", "Infinity"], ["ratePct", "-1"], ["ratePct", "37"], ["paymentTotal", "2.5"], ["intervalDays", "0"], ["graceDays", "31"], ["shop", "x".repeat(61)], ["shop", "   "]])
+  for (const [k, v] of [["capRlusd", "NaN"], ["capRlusd", "-5"], ["capRlusd", "1e9"], ["capRlusd", "10.5"], ["capRlusd", "Infinity"], ["ratePct", "-1"], ["ratePct", "37"], ["paymentTotal", "2.5"], ["intervalDays", "0"], ["graceDays", "31"], ["label", "x".repeat(61)], ["access", null], ["access", { ok: "yes" }]])
     assert.throws(() => S.apply(S.seed(), { ...base, [k]: v }), undefined, `${k}=${v} accepted`);
 });
-await t("apply stores a script-like shop name verbatim (escaped at render by main.js esc())", () => {
-  const p = S.apply(S.seed(), { ...base, shop: "<img src=x onerror=alert(1)>" }); assert.equal(p.shop, "<img src=x onerror=alert(1)>");
+await t("apply stores a script-like borrower label verbatim (escaped at render by main.js esc())", () => {
+  const p = S.apply(S.seed(), { ...base, label: "<img src=x onerror=alert(1)>" }); assert.equal(p.label, "<img src=x onerror=alert(1)>");
 });
 await t("payload value(): an amount that rounds to 0 at 6 decimals is refused [BUG payloads.js:9]", () => {
   assert.throws(() => P.value(0.0000004), /amount/, `value(0.0000004) returned "${(() => { try { return P.value(0.0000004); } catch { return "throw"; } })()}"`);
@@ -130,26 +129,14 @@ await t("payload value(): decimal strings, trailing zeros, precision", () => {
 await t("payload value(): huge amounts never produce exponent notation [BUG payloads.js:9]", () => {
   const v = (() => { try { return P.value(1e21); } catch { return "throw"; } })(); assert(v === "throw" || !/e/i.test(v), `value(1e21) = "${v}"`);
 });
-await t("enqueue rejects Infinity / negative QAK lock and non-finite amounts [BUG state.js:478-479]", () => {
-  const s = S.seed(); assert.throws(() => S.enqueue(s, BR, "first", Infinity, 0), undefined, "amount Infinity accepted");
-  assert.throws(() => S.enqueue(s, BR, "first", 10, -5), undefined, "negative QAK lock accepted");
-  assert.throws(() => S.enqueue(s, BR, "first", -1, 0)); assert.throws(() => S.enqueue(s, BR, "first", 10, 1.5)); assert.throws(() => S.enqueue(s, BR, "first", 10, Infinity));
-  assert.throws(() => S.enqueue(s, BR, "first", 10_001, 0), undefined, "above the cap"); assert.equal(S.enqueue(s, BR, "first", 10, 0).length, 1);
-});
-await t("vote: one account cannot vote twice on the same listing [BUG state.js:463-465]", () => {
-  const s = S.seed(); S.vote(s, "first", true, 600, BR); assert.throws(() => S.vote(s, "first", true, 600, BR), /already voted/);
-  assert.notEqual(s.pools[0].stage, "listed", "one 600-QAK account listed the shop by voting twice");
-  assert.throws(() => S.vote(s, "first", true, 900, SHOP, 500), /balance/, "weight above the ledger balance");
-  S.vote(s, "first", true, 500, SHOP, 500); assert.equal(s.pools[0].stage, "listed", "two accounts, 1,100 QAK by balance");
-  const s2 = S.seed(); S.voteCap(s2, "first", 800, 10, BR); assert.throws(() => S.voteCap(s2, "first", 900, 10, BR), /already voted on the cap/);
-});
-await t("localStorage tampering: sanitizeState drops malformed pools and resets holdingVerified", () => {
+await t("localStorage tampering: sanitizeState drops malformed pools and stale shop-era fields", () => {
   const good = S.seed().pools[0];
-  const st = S.sanitizeState({ pools: [{ ...good, holdingVerified: true }, { ...good, id: "x y" }, { ...good, id: "n2", network: "evil" }, { ...good, id: "n3", capRlusd: 1e9 }], queue: [{ who: 1 }] });
-  assert.equal(st.pools.length, 1); assert.equal(st.pools[0].holdingVerified, false); assert.equal(st.queue.length, 0);
+  const st = S.sanitizeState({ pools: [{ ...good, holdingVerified: true, stage: "listed", votes: { yes: 9e9, no: 0 } }, { ...good, id: "x y" }, { ...good, id: "n2", network: "evil" }, { ...good, id: "n3", capRlusd: 1e9 }], queue: [{ who: 1 }] });
+  assert.equal(st.pools.length, 1); for (const k of ["holdingVerified", "stage", "votes"]) assert(!(k in st.pools[0]), k); assert(!("queue" in st));
 });
-await xfail("localStorage tampering: a pool marked listed with no votes is rejected", "listing is local-only: sanitizeState (state.js:505-519) accepts stage 'listed' with zero votes and any votes/capVotes values; with no backend every visitor's listing state is self-asserted", () => {
-  const good = S.seed().pools[0]; const st = S.sanitizeState({ pools: [{ ...good, stage: "listed", votes: { yes: 0, no: 0 } }], queue: [] });
-  assert.equal(st.pools.length, 0);
+await t("localStorage tampering cannot grant access: no access flag is stored, and transactions re-check the ledger", () => {
+  const good = S.seed().pools[0]; const st = S.sanitizeState({ pools: [{ ...good, access: { ok: true }, accessVerified: true }] });
+  assert(!("access" in st.pools[0]) && !("accessVerified" in st.pools[0]));
+  const main = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"); assert(/const acc = accessOf\(p\.account\), listed = acc\.ok \? \[\] : \[acc\.reason\]/.test(main), "actions gate on the live access read");
 });
 done("test/review.unit.test.js");

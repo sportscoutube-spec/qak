@@ -14,8 +14,8 @@
 //        HOT account only. It never holds the broker key.
 //        2+3 one XLS-56 Batch, ALLORNOTHING, outer tx from the hot account: EscrowFinish every escrow (the hot account submits it; the XRP
 //            goes to the escrow Destination = the broker) + OfferCreate as the broker via the XLS-75 OfferCreate grant (fill-or-kill + sell,
-//            limit = quote − 3%) + [only with --payer-secrets] the Payment of the shop's presigned LoanPay amount (memo duckbank/fund)
-//        4 submit the shop's own presigned LoanPay right after the funding validates (XLS-66: only Loan.Borrower may LoanPay).
+//            limit = quote − 3%) + [only with --payer-secrets] the Payment of the borrower's presigned LoanPay amount (memo duckbank/fund)
+//        4 submit the borrower's own presigned LoanPay right after the funding validates (XLS-66: only Loan.Borrower may LoanPay).
 //        LoanManage (impair before, default after) is requested from the operator: `manage` with the cold broker key.
 //   node bot/escrow-bot.js distribute --pool <pool.json> [--dry-run] [--payer-secrets <file>]
 //        leftover proceeds (not put into the loan by LoanPay) to the pool's lenders, pro rata to their vault MPT shares at the default
@@ -24,7 +24,7 @@
 //
 // Keys (S1 split). hot: HOT_SEED + ESCROW_FULFILLMENT, or --secrets {"hotSeed","fulfillment"}. broker (cold): BROKER_SEED or --broker-secrets
 // {"brokerSeed"}; used only by `grant` and `manage`. payer (separately approved): PAYER_SEED or --payer-secrets {"payerSeed"}; signs the
-// broker's Payments (shop funding, leftover). It is the broker key itself, or an account the broker granted Payment, which XLS-75 cannot
+// broker's Payments (borrower funding, leftover). It is the broker key itself, or an account the broker granted Payment, which XLS-75 cannot
 // limit to an amount, currency or destination (so that is a full-spend key; keep it cold or approve each run). All files outside the repo,
 // mode 0600. Secrets are never printed (dry-run output redacts the fulfillment). Mainnet and testnet are refused.
 import fs from "node:fs";
@@ -87,12 +87,12 @@ export function checkGrant(entry) {
 }
 // The broker's own account signs as itself; any other payer acts for the broker through a Payment delegation (Delegate field).
 export const asBroker = (tx, broker, signer) => ({ ...tx, Account: broker, ...(signer && signer !== broker ? { Delegate: signer } : {}) });
-// S2: the presigned LoanPay's slot (TicketSequence, or Sequence) must still be unused right before the bot funds the shop.
+// S2: the presigned LoanPay's slot (TicketSequence, or Sequence) must still be unused right before the bot funds the borrower.
 export const blobSlot = (tx) => (tx.TicketSequence ? { kind: "ticket", value: tx.TicketSequence } : { kind: "sequence", value: tx.Sequence });
 export function slotStatus(tx, { accountSequence, ticketExists }) {
   const s = blobSlot(tx);
   if (s.kind === "ticket") return ticketExists ? { ok: true, ...s } : { ok: false, ...s, why: `Ticket ${s.value} is gone (used or never created)` };
-  return accountSequence === s.value ? { ok: true, ...s } : { ok: false, ...s, why: `shop Sequence is ${accountSequence}, the blob needs ${s.value}` };
+  return accountSequence === s.value ? { ok: true, ...s } : { ok: false, ...s, why: `borrower Sequence is ${accountSequence}, the blob needs ${s.value}` };
 }
 async function slotLive(c, tx) {
   const ai = (await c.request({ command: "account_info", account: tx.Account, ledger_index: "current" })).result.account_data;
@@ -101,7 +101,7 @@ async function slotLive(c, tx) {
 }
 // Funding decision from the ledger (memo duckbank/fund = LoanID:blobHash), not the local state file:
 //  paid:      this blob's LoanPay is already on the ledger;  funded: a funding Payment for this blob is on the ledger;
-//  forfeited: an earlier blob was funded and its LoanPay never landed (the shop kept that funding): the bot funds this loan no more.
+//  forfeited: an earlier blob was funded and its LoanPay never landed (the borrower kept that funding): the bot funds this loan no more.
 export function fundingState({ fundPays = [], loanPays = [], blobHash }) {
   const forfeited = fundPays.filter((f) => f.blobHash !== blobHash && !loanPays.includes(f.blobHash));
   return { paid: loanPays.includes(blobHash), funded: fundPays.some((f) => f.blobHash === blobHash), forfeited, owedByShop: forfeited.reduce((t, f) => t + f.amount, 0) };
@@ -113,7 +113,7 @@ export function fundingState({ fundPays = [], loanPays = [], blobHash }) {
 export const FINISH_MARGIN_SECONDS = 30;
 export function finishable(node, now, margin = FINISH_MARGIN_SECONDS) {
   if (node.FinishAfter != null && now < node.FinishAfter) return { ok: false, later: true, why: `FinishAfter ${node.FinishAfter} not reached (ledger time ${now}); waits` };
-  if (node.CancelAfter != null && now + margin >= node.CancelAfter) return { ok: false, later: false, why: `CancelAfter ${node.CancelAfter} passed or within ${margin}s (ledger time ${now}): the escrow can no longer be finished; it can only be cancelled back to the shop` };
+  if (node.CancelAfter != null && now + margin >= node.CancelAfter) return { ok: false, later: false, why: `CancelAfter ${node.CancelAfter} passed or within ${margin}s (ledger time ${now}): the escrow can no longer be finished; it can only be cancelled back to the borrower` };
   return { ok: true };
 }
 // Why a leftover split has no payouts: nothing to pay (leftover 0) is not the same as nobody to pay it to.
@@ -123,7 +123,8 @@ export function noPayoutReason(split, holders) {
 }
 function loadPool() {
   const f = opt("pool"); if (!f || f === true) die("--pool <pool.json> required");
-  const p = JSON.parse(fs.readFileSync(f, "utf8")); if (!NETS[p.network]) die(`network ${p.network} refused: this build runs the bot on devnet only (mainnet is hard-off)`);
+  const p = JSON.parse(fs.readFileSync(f, "utf8")); p.shop = p.borrower ?? p.shop; // pool.json "borrower" (older files: "shop"); any XRPL account
+  if (!NETS[p.network]) die(`network ${p.network} refused: this build runs the bot on devnet only (mainnet is hard-off)`);
   for (const k of ["LoanID", "LoanBrokerID", "VaultID"]) if (!/^[0-9A-F]{64}$/.test(p[k] || "")) die(`pool ${k} missing`);
   if (!S.isCondition(p.condition)) die("pool condition missing or malformed");
   const w = { ...ESCROW, ...(p.windows || {}) }; const stateFile = opt("state") || f.replace(/\.json$/, "") + ".state.json";
@@ -190,12 +191,12 @@ export function dueNow(loan, now) {
 }
 
 // Plan the atomic sell leg (pure, tested). rows: verified open escrows [{owner, seq, drops}]; unsoldDrops: XRP already finished but not sold.
-// Batch limit (XLS-56 §2.1.2): 2..8 inner txs. Slots: 1 OfferCreate, 1 Payment to the shop when included, the rest EscrowFinish. Escrows that
+// Batch limit (XLS-56 §2.1.2): 2..8 inner txs. Slots: 1 OfferCreate, 1 Payment to the borrower when included, the rest EscrowFinish. Escrows that
 // do not fit are finished first in their own txs/batches (`pre`), and their XRP is sold in the main Batch.
 // Payment amount: an ALLORNOTHING Batch can only carry fixed amounts, and the sale output is not known in advance. The OfferCreate is
 // fill-or-kill + sell, so it either sells all the XRP at or above the limit price (output >= TakerPays = minOut) or is killed, and the whole
-// Batch with it. The Payment therefore carries the shop's presigned LoanPay amount only when that amount <= minOut; any output above it stays
-// with the broker (it is leftover for the lenders, never sent to the shop). If minOut is below the LoanPay amount, the Batch carries no
+// Batch with it. The Payment therefore carries the borrower's presigned LoanPay amount only when that amount <= minOut; any output above it stays
+// with the broker (it is leftover for the lenders, never sent to the borrower). If minOut is below the LoanPay amount, the Batch carries no
 // Payment, and the Payment + LoanPay follow only if the actual output covers them (not atomic; logged).
 export function planSaleBatch({ rows, unsoldDrops = 0, quoteFor, quote, slippagePct, loanPayAmount = null, condition, fulfillment }) {
   const maxFin = B.MAX_INNER - 1 - (loanPayAmount ? 1 : 0); const inBatch = rows.slice(0, maxFin), pre = rows.slice(maxFin);
@@ -210,7 +211,7 @@ export function planSaleBatch({ rows, unsoldDrops = 0, quoteFor, quote, slippage
   return { pre: pre.map((r) => ({ tx: finish(r), row: r })), items, drops, quote: q.best, source: q.source, minOut, pay,
     why: pay ? `Payment ${pay} (the presigned LoanPay amount) <= guaranteed minimum ${minOut}` : loanPayAmount ? `LoanPay amount ${loanPayAmount} above the guaranteed minimum ${minOut}: no Payment in the Batch` : "no presigned LoanPay yet: no Payment in the Batch" };
 }
-// Check the shop's presigned LoanPay blob against the Loan (does not check that proceeds cover it).
+// Check the borrower's presigned LoanPay blob against the Loan (does not check that proceeds cover it).
 export function checkLoanPayBlob(tx, { loan, LoanID, quote, due, late }) {
   const amt = Number(tx.Amount?.value);
   return tx.TransactionType !== "LoanPay" ? "not a LoanPay" : tx.Account !== loan.Borrower ? "not signed by Loan.Borrower" : tx.LoanID !== LoanID ? "wrong LoanID"
@@ -241,7 +242,7 @@ async function once(c, ctx, secrets) {
   let openLeft = 0; const rows = [];
   for (const row of r.set.rows) { const e = r.escrows.find((x) => x.seq === row.seq && x.owner === row.owner); if (!e.node) continue; if (!row.ok) { say(`skip escrow ${row.seq}: ${row.problems.join("; ")}`); openLeft++; continue; }
     const fw = finishable(e.node, r.now); if (!fw.ok) { say(`skip escrow ${row.seq}: ${fw.why}`); if (fw.later) openLeft++; continue; } rows.push(row); }
-  // The shop's presigned LoanPay, and what the ledger says about its funding (memo duckbank/fund).
+  // The borrower's presigned LoanPay, and what the ledger says about its funding (memo duckbank/fund).
   const loan0 = await node(c, { index: p.LoanID }); let lp = null; const blobFile = opt("loanpay-blob");
   const si = await L.saleInputs(p.network, { LoanID: p.LoanID, broker: BR, shop: p.shop, escrows: p.escrows, quote: r.quote, minLedger: p.loanSetLedger ?? -1 });
   if (loan0 && loan0.PaymentRemaining > 0 && !(loan0.Flags & FLAGS.lsfLoanDefault)) {
@@ -251,12 +252,12 @@ async function once(c, ctx, secrets) {
       const fs0 = fundingState({ fundPays: si.fundPays, loanPays: si.loanPays, blobHash: hash });
       if (bad) say(`4 LoanPay blob refused: ${bad}`);
       else if (fs0.paid) say("4 LoanPay: this blob is already on the ledger");
-      else { lp = { blob, hash, tx, amt: Number(tx.Amount.value), late, due, ...fs0 }; if (blobSlot(tx).kind === "sequence") say("4 LoanPay blob uses a Sequence: ask the shop for a Ticket-based blob (TicketSequence) so its other activity cannot void it"); } }
-    else if (blobFile && rows.length && r.now < saleEnds - w.SALE_WINDOW_SECONDS / 2) return { done: false, why: `waiting for the shop's presigned LoanPay (at least ${due}) so its funding can ride in the Batch` };
+      else { lp = { blob, hash, tx, amt: Number(tx.Amount.value), late, due, ...fs0 }; if (blobSlot(tx).kind === "sequence") say("4 LoanPay blob uses a Sequence: ask the borrower for a Ticket-based blob (TicketSequence) so its other activity cannot void it"); } }
+    else if (blobFile && rows.length && r.now < saleEnds - w.SALE_WINDOW_SECONDS / 2) return { done: false, why: `waiting for the borrower's presigned LoanPay (at least ${due}) so its funding can ride in the Batch` };
   }
-  // May the bot fund the shop now? Ledger-derived: never twice for one blob, never again after a forfeit, only with the payer key and a live slot.
+  // May the bot fund the borrower now? Ledger-derived: never twice for one blob, never again after a forfeit, only with the payer key and a live slot.
   const canFund = async () => { if (!lp || lp.funded || !payer) return { ok: false, why: !lp ? "no blob" : lp.funded ? "already funded (ledger)" : "no payer key: funding needs the separately approved payer (--payer-secrets)" };
-    if (lp.forfeited.length) return { ok: false, why: `the shop kept an earlier funding of ${lp.owedByShop} without its LoanPay landing (${lp.forfeited.map((f) => f.hash).join(", ")}): no more funding for this loan; recorded as owed by the shop` };
+    if (lp.forfeited.length) return { ok: false, why: `the borrower kept an earlier funding of ${lp.owedByShop} without its LoanPay landing (${lp.forfeited.map((f) => f.hash).join(", ")}): no more funding for this loan; recorded as owed by the borrower` };
     const sl = await slotLive(c, lp.tx); return sl.ok ? { ok: true } : { ok: false, why: `presigned LoanPay is void before funding (${sl.why}): no funding sent` }; };
   const fundTx = (amt) => asBroker({ TransactionType: "Payment", Destination: loan0.Borrower, Amount: { ...r.quote, value: P.value(amt) }, Memos: [L.fundMemo(p.LoanID, lp.hash)] }, BR, payer?.address);
   const unsold = state.finishedDrops - state.soldDrops;
@@ -278,7 +279,7 @@ async function once(c, ctx, secrets) {
           grp.forEach((x, i) => { if (res.inners[i].ok) state.finishedDrops += x.row.drops; }); save(); say(`${res.check.ok ? "OK" : "!!"} pre-finish Batch ${res.hash} ${res.check.problems.join("; ")}`);
         }
         const res = await B.submitBatch(c, hot, { mode: "ALLORNOTHING", items: items.map(({ tx, account, sequence }) => ({ tx, account, sequence })), signerWallets: plan2.pay ? [payer] : [], record: recordB,
-          label: `2+3 Batch ALLORNOTHING: EscrowFinish ×${items.filter((x) => x.row).length} + OfferCreate FoK as the broker (min ${plan2.minOut})${plan2.pay ? ` + Payment ${plan2.pay} to the shop (payer key)` : ""}` });
+          label: `2+3 Batch ALLORNOTHING: EscrowFinish ×${items.filter((x) => x.row).length} + OfferCreate FoK as the broker (min ${plan2.minOut})${plan2.pay ? ` + Payment ${plan2.pay} to the borrower (payer key)` : ""}` });
         say(`${res.check.ok ? "OK" : "!!"} 2+3 Batch ${res.hash}: outer ${res.result}; inner ${res.check.rows.map((x, i) => `${items[i].tx.TransactionType} ${x.hash} ${x.result ?? "not applied"}`).join(", ")}`);
         if (res.check.problems.length) say("   batch problems:", res.check.problems.join("; "));
         if (res.check.ok) {
@@ -287,22 +288,22 @@ async function once(c, ctx, secrets) {
           const sold = -L.balanceDelta(off.meta, BR, "XRP"), got = L.balanceDelta(off.meta, BR, r.quote);
           state.soldDrops += Math.max(0, sold); state.proceeds += got;
           if (plan2.pay) { lp.funded = true; state.shopFunded = (state.shopFunded || 0) + plan2.pay; }
-          save(); say(`sold ${sold / S.DROPS} XRP for ${got} (guaranteed minimum ${plan2.minOut})${plan2.pay ? `, paid ${plan2.pay} to the shop in the same Batch` : ""}`);
+          save(); say(`sold ${sold / S.DROPS} XRP for ${got} (guaranteed minimum ${plan2.minOut})${plan2.pay ? `, paid ${plan2.pay} to the borrower in the same Batch` : ""}`);
         } else { openLeft += rows.length; say("the Batch applied nothing (ALLORNOTHING); it is retried on the next pass with a fresh quote"); }
       }
     }
   }
-  // Step 4: fund (if not in the Batch) and submit the shop's presigned LoanPay at once. Funding Payment: memo duckbank/fund, LastLedgerSequence +3.
+  // Step 4: fund (if not in the Batch) and submit the borrower's presigned LoanPay at once. Funding Payment: memo duckbank/fund, LastLedgerSequence +3.
   if (lp && !DRY) {
     const left = state.proceeds - state.delivered;
     if (!lp.funded) { const cf = await canFund();
-      if (cf.ok && left + 1e-9 >= lp.amt) { const pay = await submit(c, payer, fundTx(lp.amt), state, `4a Payment ${lp.amt} to the shop (memo duckbank/fund; payer key)`, save, { lls: 3 }); if (pay.code === "tesSUCCESS") lp.funded = true; }
+      if (cf.ok && left + 1e-9 >= lp.amt) { const pay = await submit(c, payer, fundTx(lp.amt), state, `4a Payment ${lp.amt} to the borrower (memo duckbank/fund; payer key)`, save, { lls: 3 }); if (pay.code === "tesSUCCESS") lp.funded = true; }
       else say(`4 LoanPay: not funded (${cf.ok ? `proceeds left ${left} are below the presigned ${lp.amt}; LoanPay takes no partial payment, so this part is a shortfall` : cf.why})`); }
     if (lp.funded) { const sl = await slotLive(c, lp.tx);
-      if (!sl.ok) say(`!! 4 LoanPay void after funding (${sl.why}): the shop kept ${lp.amt}; recorded as owed by the shop, no more funding for this loan`);
-      else { const res = await submitBlob(c, lp.blob, state, `4 LoanPay ${lp.amt} (shop-presigned${lp.late ? ", tfLoanLatePayment" : ""}, ${sl.kind})`, save);
-        (state.loanPays ||= []).push(lp.hash); if (res.code === "tesSUCCESS") state.delivered += lp.amt; else say(`!! 4 LoanPay ${res.code}: the shop kept the funding; recorded as owed by the shop`); save(); } }
-  } else if (lp && DRY) say(`[dry-run] would fund (payer key, after the slot check) and submit the shop's presigned LoanPay ${lp.amt}`);
+      if (!sl.ok) say(`!! 4 LoanPay void after funding (${sl.why}): the borrower kept ${lp.amt}; recorded as owed by the borrower, no more funding for this loan`);
+      else { const res = await submitBlob(c, lp.blob, state, `4 LoanPay ${lp.amt} (borrower-presigned${lp.late ? ", tfLoanLatePayment" : ""}, ${sl.kind})`, save);
+        (state.loanPays ||= []).push(lp.hash); if (res.code === "tesSUCCESS") state.delivered += lp.amt; else say(`!! 4 LoanPay ${res.code}: the borrower kept the funding; recorded as owed by the borrower`); save(); } }
+  } else if (lp && DRY) say(`[dry-run] would fund (payer key, after the slot check) and submit the borrower's presigned LoanPay ${lp.amt}`);
   // Default the rest when the ledger allows it and nothing more can be delivered (or the sale window is over): cold broker key.
   const l2 = await node(c, { index: p.LoanID });
   if (l2 && l2.PaymentRemaining > 0 && !(l2.Flags & FLAGS.lsfLoanDefault)) {

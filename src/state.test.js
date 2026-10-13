@@ -1,4 +1,4 @@
-import * as S from "./state.js"; import { RULES as R, TOKENOMICS as K, TEAM, ROADMAP, FIRST_POOL, NETWORKS, AMENDMENTS } from "./config.js"; import assert from "node:assert";
+import * as S from "./state.js"; import { RULES as R, TOKENOMICS as K, TEAM, ROADMAP, FIRST_POOL, NETWORKS, AMENDMENTS, ACCESS } from "./config.js"; import assert from "node:assert";
 const ok = (n) => console.log("ok -", n); const A = "rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY"; const DAY = 86400;
 const near = (a, b, eps = 1e-6) => assert(Math.abs(a - b) < eps, `${a} != ${b}`);
 
@@ -48,7 +48,7 @@ ok("tokenomics, team, roadmap");
   for (const fee of [750, 1000]) assert(S.loanSetCapCheck({ AssetsMaximum: 10000, DebtMaximum: 10000, AssetsTotal: pl.maxPrincipal, AssetsAvailable: pl.maxPrincipal, DebtTotal: 0 }, pl.maxPrincipal, t, fee).ok);
   assert.equal(S.maxPrincipal({ AssetsMaximum: 10000, DebtMaximum: 10000, AssetsTotal: 10000, AssetsAvailable: 10000 }, t, 750).max, 0);
   const mx = S.maxPrincipal({ AssetsMaximum: 10000, DebtMaximum: 10000, AssetsTotal: 9000, AssetsAvailable: 9000, DebtTotal: 0 }, t, 750); assert.equal(mx.max, 8999.99); assert.equal(mx.reason, "AssetsAvailable");
-  assert.equal(S.capMathFeeRate({ ledger: { ManagementFeeRate: null } }), 750); assert.equal(S.capMathFeeRate({ ledger: { ManagementFeeRate: 1000 } }), 1000);
+  assert.equal(S.capMathFeeRate({ ledger: { ManagementFeeRate: null } }), 1000); assert.equal(S.capMathFeeRate({ ledger: { ManagementFeeRate: 1000 } }), 1000);
   ok("cap math: interest counts toward AssetsMaximum/DebtMaximum; max principal 9,839.02 under 10,000"); }
 
 // Cover (XLS-66 §3.8.5.2 #20, §3.10.5)
@@ -84,32 +84,49 @@ ok("tokenomics, team, roadmap");
   assert.match(NETWORKS.devnet.asset.label, /test token/); assert.match(NETWORKS.devnet.asset.label, /not RLUSD/); assert.equal(NETWORKS.mainnet.vaultLending, false, "mainnet hard-off");
   ok("gating: all three amendments required, mainnet hard-off, devnet needs a test issuer"); }
 
-// QAK fee cut at broker creation
-{ assert.equal(S.feeRateAtBrokerCreation(99_999), 1000); assert.equal(S.feeRateAtBrokerCreation(100_000), 750); assert.equal(S.feePct(750), "0.75"); ok("fee cut decided at broker creation"); }
+// One fee rate for every borrower (no QAK fee cut)
+{ assert.equal(R.FEE_RATE, 1000); for (const k of ["FEE_RATE_DISCOUNT", "DISCOUNT_MIN_HOLDING_QAK", "LISTING_LOCK_QAK", "LIST_VOTE_THRESHOLD_QAK"]) assert(!(k in R), k + " removed");
+  assert.equal(S.feeRateAtBrokerCreation, undefined); assert.equal(S.feePct(1000), "1.00"); ok("one ManagementFeeRate (1000), no QAK fee cut"); }
 
-// Application, votes, queue, ledger ids
-{ const s = S.seed(); const f = { shop: " Shop ", city: "Athens", purpose: "stock", capRlusd: 10000, ratePct: 10, paymentTotal: 3, intervalDays: 30, graceDays: 7, listingLock: 250000, account: A, ledgerQak: 250000, ledgerVerified: true };
+// Application (any account with lifetime access), ledger ids, no votes or queue
+{ const s = S.seed(), access = { ok: true, hash: "E".repeat(64), ledger: 99, delivered: 1e6 };
+  const f = { label: " Borrower A ", capRlusd: 10000, ratePct: 10, paymentTotal: 3, intervalDays: 30, graceDays: 7, account: A, access };
   assert.throws(() => S.apply(s, { ...f, account: undefined }), /connect/); assert.throws(() => S.apply(s, { ...f, account: "guest" }), /connect/);
-  for (const [k, v, re] of [["shop", "  ", /required/], ["shop", "x".repeat(61), /max 60/], ["city", "", /required/], ["ratePct", -1, /rate/], ["ratePct", 36.5, /rate/], ["ratePct", "abc", /number/],
+  assert.throws(() => S.apply(s, { ...f, access: undefined }), /lifetime access/); assert.throws(() => S.apply(s, { ...f, access: { ok: false } }), /lifetime access/);
+  assert.throws(() => S.apply(s, { ...f, account: S.PREVIEW_ACCOUNT }), /mock wallet/);
+  for (const [k, v, re] of [["label", "x".repeat(61), /max 60/], ["ratePct", -1, /rate/], ["ratePct", 36.5, /rate/], ["ratePct", "abc", /number/],
     ["capRlusd", 0, /cap/], ["capRlusd", 10001, /cap/], ["capRlusd", 1.5, /cap/], ["paymentTotal", 0, /payments/], ["paymentTotal", 13, /payments/], ["intervalDays", 0, /interval/], ["intervalDays", 91, /interval/],
-    ["graceDays", 31, /GracePeriod <= PaymentInterval/], ["graceDays", 0, /grace/], ["listingLock", 250001, /listing lock/], ["ledgerQak", 249999, /covered/], ["ledgerQak", undefined, /covered/], ["purpose", "x", /purpose/]])
+    ["graceDays", 31, /GracePeriod <= PaymentInterval/], ["graceDays", 0, /grace/]])
     assert.throws(() => S.apply(s, { ...f, [k]: v }), re, k + "=" + v);
   assert.throws(() => S.apply(s, { ...f, paymentTotal: 12, intervalDays: 30 }), /180 days/);
-  const p = S.apply(s, f); assert.equal(p.shop, "Shop"); assert.equal(p.terms.InterestRate, 10000); assert.equal(p.terms.GracePeriod, 7 * DAY); assert.equal(p.ledger.VaultID, null);
-  assert(/^p_[0-9a-f-]{36}$/.test(p.id)); assert(S.planFits(p.plan, p.terms));
-  assert.throws(() => S.vote(s, p.id, true, 10), /connect/); assert.throws(() => S.vote(s, p.id, true, 2e9, A), /QAK weight/);
-  S.voteCap(s, p.id, 8000, 5000, A); S.vote(s, p.id, true, 1200, A); assert.equal(p.stage, "listed"); assert.equal(p.capRlusd, 8000); assert.throws(() => S.voteCap(s, p.id, 9000, 1, A), /only while applied/);
-  assert.throws(() => S.voteCap(S.seed(), "first", 10001, 1, A), /cap vote/);
-  S.enqueue(s, A, p.id, 100, 5); S.enqueue(s, "rB" + "x".repeat(30), p.id, 100, 50); assert.equal(s.queue[0].qakLocked, 50);
+  const p = S.apply(s, f); assert.equal(p.label, "Borrower A"); assert.equal(p.terms.InterestRate, 10000); assert.equal(p.terms.GracePeriod, 7 * DAY); assert.equal(p.ledger.VaultID, null);
+  assert(/^p_[0-9a-f-]{36}$/.test(p.id)); assert(S.planFits(p.plan, p.terms)); assert.equal(S.apply(s, { ...f, label: "  " }).label, null, "label is optional");
+  for (const k of ["shop", "city", "purpose", "votes", "capVotes", "voters", "listingLock", "stage", "path", "deskFile", "shopHoldingQak"]) assert(!(k in p), k + " gone");
+  assert(!("queue" in s)); for (const fn of ["vote", "voteCap", "enqueue"]) assert.equal(S[fn], undefined, fn + " removed");
   const V = "B".repeat(64); S.recordLedger(s, p.id, "VaultID", V); assert.throws(() => S.recordLedger(s, p.id, "VaultID", "C".repeat(64)), /already set/);
-  assert.throws(() => S.recordLedger(s, "first", "VaultID", V), /another shop/); ok("application, votes, queue, one shop per vault"); }
+  assert.throws(() => S.recordLedger(s, "first", "VaultID", V), /another borrower/); ok("application: any account with lifetime access; optional label; one borrower per vault; no votes or queue"); }
 
-// Load-time validation
-{ const s = S.seed(); const p = S.apply(s, { shop: "A", city: "B", purpose: "stock", capRlusd: 5000, ratePct: 5, paymentTotal: 1, intervalDays: 30, graceDays: 30, listingLock: 250000, account: A, ledgerQak: 3e5 });
+// Lifetime access from account_tx rows (delivered_amount, QAK issuer, destination, validated, tesSUCCESS)
+{ const Q = { currency: "QAK", issuer: "r98RkKUasH5vA3mshD5Bi3eAVHCYwziY9M" }, row = (o = {}, m = {}) => ({ hash: "H".repeat(64), ledger: 5, validated: true,
+    tx: { TransactionType: "Payment", Account: A, Destination: ACCESS.ADDRESS, Amount: { ...Q, value: "1000000" }, ...o }, meta: { TransactionResult: "tesSUCCESS", delivered_amount: { ...Q, value: "1000000" }, ...m } });
+  assert(S.isAccessPayment(row(), A)); assert(S.isAccessPayment(row({}, { delivered_amount: { ...Q, value: "1500000" } }), A));
+  assert(!S.isAccessPayment(row({}, { delivered_amount: { ...Q, value: "999999.999999" } }), A), "partial payment: delivered < fee");
+  assert(!S.isAccessPayment(row({}, { delivered_amount: { currency: "QAK", issuer: "rFAKEissuerxxxxxxxxxxxxxxxxxxxxxx", value: "1000000" } }), A), "wrong issuer");
+  assert(!S.isAccessPayment(row({}, { delivered_amount: "1000000000000" }), A), "XRP is not QAK");
+  assert(!S.isAccessPayment(row({ Destination: "rOTHERxxxxxxxxxxxxxxxxxxxxxxxxxxx" }), A)); assert(!S.isAccessPayment(row({ Account: "rOTHERxxxxxxxxxxxxxxxxxxxxxxxxxxx" }), A), "someone else paying does not count for A");
+  assert(!S.isAccessPayment(row({}, { TransactionResult: "tecPATH_PARTIAL" }), A)); assert(!S.isAccessPayment({ ...row(), validated: false }, A)); assert(!S.isAccessPayment(row({ TransactionType: "EscrowCreate" }), A));
+  assert(!S.isAccessPayment(row({}, { delivered_amount: undefined }), A), "no delivered_amount: not counted");
+  const a = S.accessFrom([row({ Destination: "rOTHERxxxxxxxxxxxxxxxxxxxxxxxxxxx" }), row()], A); assert(a.ok && a.delivered === 1e6 && a.hash === "H".repeat(64));
+  assert(!S.accessFrom([], A).ok); assert.match(S.accessFrom([], A).reason, /1,000,000 QAK/); ok("lifetime access: delivered_amount >= 1,000,000 QAK of the QAK issuer, from the account, to the access address, validated tesSUCCESS"); }
+
+// Load-time validation (old shop-era fields dropped)
+{ const s = S.seed(); const p = S.apply(s, { capRlusd: 5000, ratePct: 5, paymentTotal: 1, intervalDays: 30, graceDays: 30, account: A, access: { ok: true } });
   const bad = JSON.parse(JSON.stringify(s)); const t = bad.pools[1];
-  bad.pools.push({ ...t, id: "x<img>" }, { ...t, id: "ok2", shop: "y".repeat(500) }, { ...t, id: "ok3", terms: { ...t.terms, GracePeriod: t.terms.PaymentInterval + 1 } }, { ...t }, null,
-    { ...t, id: "ok4", ledger: { ...t.ledger, VaultID: "fake-id" } }, { ...t, id: "ok5", capRlusd: 20000 }, { ...t, id: "ok6", stage: "drawn" });
-  const c = S.sanitizeState(bad); assert.equal(c.pools.length, 2); assert.equal(S.sanitizeState({ pools: "x" }), null); assert.equal(S.sanitizeState(null), null);
-  const two = JSON.parse(JSON.stringify(s)); two.pools[0].ledger.VaultID = "D".repeat(64); two.pools[1].ledger.VaultID = "D".repeat(64); assert.equal(S.sanitizeState(two).pools.length, 1, "second shop on the same vault dropped");
-  assert.equal(p.ledger.LoanID, null); ok("load-time validation drops bad records and duplicate vaults"); }
+  bad.pools.push({ ...t, id: "x<img>" }, { ...t, id: "ok2", label: "y".repeat(500) }, { ...t, id: "ok3", terms: { ...t.terms, GracePeriod: t.terms.PaymentInterval + 1 } }, { ...t }, null,
+    { ...t, id: "ok4", ledger: { ...t.ledger, VaultID: "fake-id" } }, { ...t, id: "ok5", capRlusd: 20000 }, { ...t, id: "ok6", path: "cover-only" }, { ...t, id: "ok7", ledger: { ...t.ledger, ManagementFeeRate: 750 } });
+  const old = { ...t, id: "old", shop: "Kostas", city: "Athens", purpose: "stock", votes: { yes: 5, no: 0 }, capVotes: {}, voters: [], listingLock: { qak: 250000 }, stage: "listed" }; bad.pools.push(old); bad.queue = [{ who: A }];
+  const c = S.sanitizeState(bad); assert.equal(c.pools.length, 3); assert.equal(S.sanitizeState({ pools: "x" }), null); assert.equal(S.sanitizeState(null), null);
+  const o = c.pools.find((x) => x.id === "old"); for (const k of ["shop", "city", "purpose", "votes", "listingLock", "stage"]) assert(!(k in o), k + " not carried over"); assert(!("queue" in c));
+  const two = JSON.parse(JSON.stringify(s)); two.pools[0].ledger.VaultID = "D".repeat(64); two.pools[1].ledger.VaultID = "D".repeat(64); assert.equal(S.sanitizeState(two).pools.length, 1, "second borrower on the same vault dropped");
+  assert.equal(p.ledger.LoanID, null); ok("load-time validation drops bad records, duplicate vaults, the cover-only path and old shop-era fields"); }
 console.log("state tests ok");

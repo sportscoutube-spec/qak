@@ -1,6 +1,6 @@
 // Unsigned XLS-65/66 transaction JSON for Xaman sign requests. Field and flag names are copied from the spec text.
 // Xaman fills Account, Sequence and Fee. Nothing here signs or submits.
-import { SPEC, FLAGS, RULES as R } from "./config.js";
+import { SPEC, FLAGS, RULES as R, ACCESS, QAK_ISSUER, QAK_CURRENCY } from "./config.js";
 import { checkVaultDates, validateLoanTerms, isCondition, DROPS } from "./state.js";
 const req = (c, m) => { if (!c) throw new Error(m); };
 const isId = (x) => typeof x === "string" && /^[0-9A-F]{64}$/.test(x);
@@ -44,9 +44,9 @@ export function loanBrokerCoverDeposit({ LoanBrokerID, asset, amount }) {
 export function vaultDeposit({ VaultID, asset, amount }) {
   req(isId(VaultID), "VaultID required"); return { TransactionType: "VaultDeposit", VaultID, Amount: iou(asset, amount) };
 }
-// LoanSet (§3.8), broker-initiated (§3.8.3): the broker signs first with Counterparty = the shop; the shop then fills CounterpartySignature.
+// LoanSet (§3.8), broker-initiated (§3.8.3): the broker signs first with Counterparty = the borrower; the borrower then fills CounterpartySignature.
 export function loanSet({ LoanBrokerID, Counterparty, PrincipalRequested, terms, fees = {} }) {
-  req(isId(LoanBrokerID), "LoanBrokerID required"); req(isAcct(Counterparty), "Counterparty (the shop account) required");
+  req(isId(LoanBrokerID), "LoanBrokerID required"); req(isAcct(Counterparty), "Counterparty (the borrower account) required");
   const t = { ...terms, PrincipalRequested: Number(PrincipalRequested) }; const e = validateLoanTerms(t); req(e.length === 0, e.join("; "));
   return { TransactionType: "LoanSet", Flags: 0, LoanBrokerID, Counterparty, PrincipalRequested: value(PrincipalRequested),
     InterestRate: t.InterestRate, PaymentTotal: t.PaymentTotal, PaymentInterval: t.PaymentInterval, GracePeriod: t.GracePeriod,
@@ -64,7 +64,7 @@ export function withCounterpartySignature(tx, sig) {
 }
 // A LoanSet outside a Batch without CounterpartySignature fails temBAD_SIGNER (§3.8.5.1 #2).
 export function assertLoanSetComplete(tx) { req(tx && tx.CounterpartySignature, "LoanSet without CounterpartySignature fails (temBAD_SIGNER)"); return true; }
-// LoanPay (§3.11): the shop pays a fixed installment. Late payments need tfLoanLatePayment.
+// LoanPay (§3.11): the borrower pays a fixed installment. Late payments need tfLoanLatePayment.
 export function loanPay({ LoanID, asset, amount, late = false }) {
   req(isId(LoanID), "LoanID required"); return { TransactionType: "LoanPay", LoanID, Amount: iou(asset, amount), Flags: late ? FLAGS.tfLoanLatePayment : 0 };
 }
@@ -80,7 +80,7 @@ export function loanDelete({ LoanID }) { req(isId(LoanID), "LoanID required"); r
 // ---------- XRP escrow beside the loan (xrpl.org EscrowCreate / EscrowFinish; OfferCreate) ----------
 const drops = (xrp) => { const d = Math.round(Number(xrp) * DROPS); req(Number.isSafeInteger(d) && d > 0, "XRP amount must be > 0"); return String(d); };
 const isTime = (x) => Number.isInteger(x) && x > 0;
-// EscrowCreate by the shop: XRP to the broker wallet, locked by a PREIMAGE-SHA-256 Condition. A conditional escrow must have CancelAfter
+// EscrowCreate by the borrower: XRP to the broker wallet, locked by a PREIMAGE-SHA-256 Condition. A conditional escrow must have CancelAfter
 // (xrpl.org: "Conditional with expiration" or "Timed conditional with expiration"); FinishAfter, if set, must be before CancelAfter.
 export function escrowCreate({ Destination, amountXrp, Condition, CancelAfter, FinishAfter }) {
   req(isAcct(Destination), "Destination (the broker wallet) required"); req(isCondition(Condition), "Condition must be a PREIMAGE-SHA-256 condition (32-byte preimage)");
@@ -101,4 +101,14 @@ export function escrowFinish({ Owner, OfferSequence, Condition, Fulfillment }) {
 export function offerSellXrp({ xrpDrops, quote, minQuote, fillOrKill = false }) {
   req(Number.isSafeInteger(xrpDrops) && xrpDrops > 0, "XRP drops required"); req(quote && isAcct(quote.issuer), "quote issuer required");
   return { TransactionType: "OfferCreate", Flags: ((fillOrKill ? FLAGS.tfFillOrKill : FLAGS.tfImmediateOrCancel) | FLAGS.tfSell) >>> 0, TakerGets: String(xrpDrops), TakerPays: { currency: quote.currency, issuer: quote.issuer, value: value(minQuote) } };
+}
+
+// Lifetime access fee (app rule): a QAK Payment on mainnet from the borrower to ACCESS.ADDRESS, exactly ACCESS.FEE_QAK, with the memo
+// duckbank/access. No tfPartialPayment, no SendMax, no paths: it delivers the full amount or fails. Account is pinned to the signer.
+const memoHex = (t) => Array.from(new TextEncoder().encode(t)).map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+export function accessPayment({ account }) {
+  req(isAcct(account), "connect the borrower account first");
+  req(account !== ACCESS.ADDRESS, "the access address cannot pay itself");
+  return { TransactionType: "Payment", Account: account, Destination: ACCESS.ADDRESS, Amount: { currency: QAK_CURRENCY, issuer: QAK_ISSUER, value: value(ACCESS.FEE_QAK) },
+    Flags: 0, Memos: [{ Memo: { MemoType: memoHex(ACCESS.MEMO_TYPE), MemoData: memoHex(account) } }] };
 }

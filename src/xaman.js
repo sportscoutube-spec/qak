@@ -12,8 +12,8 @@ export const hasKey = () => /^[0-9a-f-]{36}$/i.test(CONFIG.xamanApiKey) && !/^0{
 export const XAMAN_SUPPORT = {
   forceNetwork: "DEVNET is a key in Xaman's network rails, so a payload can set options.force_network: \"DEVNET\".",
   txTypes: "Not verified. Xaman's docs: transaction types for amendments that are not voted in on mainnet may be unavailable. If Xaman rejects a payload, the error is shown.",
-  escrow: "EscrowCreate (the shop's XRP escrow to the broker) is a standard mainnet transaction type. Xaman's developer docs say Xaman accepts all mainnet XRPL transaction types, so it is supported; the Condition is a plain hex field.",
-  counterparty: "Not available. Xaman does not document signing a LoanSet CounterpartySignature, so the shop's counter-signature cannot be collected in this app. Note: with fixCleanup3_4_0 enabled (devnet), the counter-signature must use the counterparty hash prefix \"CPT\\0\" (0x43505400), not the normal \"STX\\0\"; a plain transaction signature is rejected as a bad signature (seen in the devnet test run).",
+  escrow: "EscrowCreate (the borrower's XRP escrow to the broker) is a standard mainnet transaction type. Xaman's developer docs say Xaman accepts all mainnet XRPL transaction types, so it is supported; the Condition is a plain hex field.",
+  counterparty: "Not available. Xaman does not document signing a LoanSet CounterpartySignature, so the borrower's counter-signature cannot be collected in this app. Note: with fixCleanup3_4_0 enabled (devnet), the counter-signature must use the counterparty hash prefix \"CPT\\0\" (0x43505400), not the normal \"STX\\0\"; a plain transaction signature is rejected as a bad signature (seen in the devnet test run).",
 };
 
 async function load() {
@@ -53,4 +53,12 @@ export async function signTx(txjson, net, { submit = true, instruction = "" } = 
   if (wallet.mode === "mock") return { mock: true, signed: false, note: "mock: nothing signed or submitted", txjson };
   if (wallet.mode !== "xaman") throw new Error("connect Xaman first");
   return run(txjson, { force_network: n.xaman, submit }, instruction || `Duck Bank: ${txjson.TransactionType} on ${n.label}`, wallet.account);
+}
+// Lifetime access fee: a QAK Payment, and QAK exists only on mainnet. Same rule as every other payload in this build: Xaman signing is
+// allowed only on a network whose `vaultLending` flag is on, and mainnet is hard-off. So this payload is built and shown, but not
+// sent to Xaman, until mainnet is enabled in a later build; paying from any other wallet counts, because the check reads the ledger.
+export const ACCESS_SIGNING = () => NETWORKS.mainnet.vaultLending === true;
+export async function signAccessFee(txjson) {
+  if (!ACCESS_SIGNING()) throw new Error("mainnet signing is off in this build: the access payment cannot be sent through Xaman yet (the ledger check still counts a payment made from any wallet)");
+  return signTx(txjson, "mainnet", { instruction: "Duck Bank lifetime access fee (QAK)" });
 }

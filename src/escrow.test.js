@@ -1,6 +1,6 @@
-// XRP escrow path: payload shape, LoanSet gate, ratio math from mocked amm_info/book_offers, lines and window, sale steps, no-XRP cap, phrase bans.
+// XRP escrow beside every loan: payload shape, LoanSet gate, ratio math from mocked amm_info/book_offers, lines and window, sale steps, phrase bans.
 import * as S from "./state.js"; import * as P from "./payloads.js"; import * as L from "./ledger.js";
-import { ESCROW as E, NO_XRP, PATHS, FIRST_POOL, RULES, FLAGS, MARKETS } from "./config.js";
+import * as C from "./config.js"; import { ESCROW as E, FIRST_POOL, RULES, FLAGS, MARKETS } from "./config.js";
 import assert from "node:assert"; import fs from "node:fs"; import path from "node:path"; import { fileURLToPath } from "node:url";
 const ok = (n) => console.log("ok -", n); const near = (a, b, eps = 1e-6) => assert(Math.abs(a - b) < eps, `${a} != ${b}`);
 const SHOP = "rBZaALm7Pz1bGq5yvN2nYb9E1S1U6s2d1F", BROKER = "rBRR9DokhcK4TofnNm4dCt8pDVa1cHqo8N", ISS = "rHprdcgDE8VM5PgjPjKGMjZGWGh98V4CHp";
@@ -8,8 +8,8 @@ const COND = "A0258020" + "AB".repeat(32) + "810120", Q = { currency: "USD", iss
 
 // Config values (flagged app rules)
 assert.equal(E.ADD_LINE_PCT, 150); assert.equal(E.DEFAULT_LINE_PCT, 120); assert(E.ADD_WINDOW_SECONDS > 0 && E.SALE_WINDOW_SECONDS > 0 && E.CANCEL_AFTER_BUFFER_SECONDS > 0);
-assert.equal(NO_XRP.MAX_CAP_RLUSD, 1000); assert.equal(FIRST_POOL.path, PATHS.escrow); assert.equal(FIRST_POOL.capRlusd, 10000);
-assert.equal(MARKETS.mainnet.quote.currency, "524C555344000000000000000000000000000000"); assert.equal(MARKETS.testnet, null); ok("config: lines 150/120, windows, no-XRP cap 1,000, first pool on the escrow path");
+assert.equal(C.NO_XRP, undefined, "no cover-only path"); assert.equal(C.PATHS, undefined); assert.equal(FIRST_POOL.capRlusd, 10000);
+assert.equal(MARKETS.mainnet.quote.currency, "524C555344000000000000000000000000000000"); assert.equal(MARKETS.testnet, null); ok("config: lines 150/120, windows, no cover-only path");
 
 // Escrow payload shape (XRPL Escrow docs: Amount in drops, Destination, PREIMAGE-SHA-256 Condition, CancelAfter, optional FinishAfter < CancelAfter)
 { const tx = P.escrowCreate({ Destination: BROKER, amountXrp: 12.5, Condition: COND, CancelAfter: 900000000, FinishAfter: 800000000 });
@@ -64,9 +64,9 @@ const fetchMock = (by) => async (url, opt) => { const b = JSON.parse(opt.body); 
   b = S.botPlan({ loan: { ...loan, Flags: FLAGS.lsfLoanImpaired }, margin: { state: "ok" }, now: 1101 }); assert(b.sell);
   ok("lines and window: 150% add line, window, 120% default line arms the bot; impair only once overdue"); }
 
-// LoanSet blocked without an escrow; cover-only cap
+// LoanSet blocked without an escrow
 { const p = { ...S.seed().pools[0], escrow: { condition: COND, records: [] } };
-  let g = S.loanSetEscrowGate(p, {}); assert(!g.ok); assert(g.reasons.some((r) => /blocked until the shop's XRP escrow/.test(r)));
+  let g = S.loanSetEscrowGate(p, {}); assert(!g.ok); assert(g.reasons.some((r) => /blocked until the borrower's XRP escrow/.test(r)));
   g = S.loanSetEscrowGate({ ...p, escrow: { condition: null, records: [] } }, { escrows: { verified: 1, drops: 1 }, ratio: 200 }); assert(!g.ok && /Condition/.test(g.reasons[0]));
   g = S.loanSetEscrowGate(p, { escrows: { verified: 1, drops: 1 }, ratio: 149.9 }); assert(!g.ok && /150% add line/.test(g.reasons[0]));
   g = S.loanSetEscrowGate(p, { escrows: { verified: 1, drops: 1 }, noMarket: true }); assert(!g.ok);
@@ -76,17 +76,13 @@ const fetchMock = (by) => async (url, opt) => { const b = JSON.parse(opt.body); 
   const node = { LedgerEntryType: "Escrow", Account: SHOP, Destination: BROKER, Condition: COND, Amount: "7000000", CancelAfter: 500 };
   const set = S.escrowSet([{ owner: SHOP, seq: 3, node }, { owner: SHOP, seq: 4, node: { ...node, Destination: SHOP } }, { owner: SHOP, seq: 5, node: null }, { owner: SHOP, seq: 6, node: { ...node, CancelAfter: 499 } }, { owner: SHOP, seq: 7, node: { ...node, Condition: COND.replace("AB", "AC") } }], exp);
   assert.equal(set.verified, 1); assert.equal(set.drops, 7_000_000); assert.equal(set.rows.filter((r) => !r.ok).length, 4);
-  // cover-only path: cap <= 1,000 and a desk file
-  const st = S.seed(), base = { shop: "Kiosk", city: "Patra", purpose: "stock", capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", listingLock: String(RULES.LISTING_LOCK_QAK), account: SHOP, ledgerQak: RULES.LISTING_LOCK_QAK, ledgerVerified: true };
-  assert.throws(() => S.apply(st, { ...base, path: PATHS.cover, capRlusd: "1001", deskFile: "id + lease" }), /cover-only path with a cap of at most 1,000/);
-  assert.throws(() => S.apply(st, { ...base, path: PATHS.cover, deskFile: "" }), /desk/);
-  const cp = S.apply(st, { ...base, path: PATHS.cover, deskFile: "id + lease" }); assert.equal(cp.path, PATHS.cover); assert(S.loanSetEscrowGate(cp).ok);
-  assert(!S.loanSetEscrowGate({ ...cp, capRlusd: 5000 }).ok); assert(!S.loanSetEscrowGate({ ...cp, deskFile: null }).ok);
-  const ep = S.apply(S.seed(), { ...base, capRlusd: "5000" }); assert.equal(ep.path, PATHS.escrow); assert.deepEqual(ep.escrow, { condition: null, records: [] });
-  assert.throws(() => S.recordCondition(st, cp.id, COND), /cover-only/); S.recordCondition(st, "first", COND.toLowerCase()); assert.equal(st.pools[0].escrow.condition, COND);
+  // every pool is on the escrow path: no cover-only branch, a fresh application starts with no escrow on record and the LoanSet gate closed
+  const st = S.seed(), base = { capRlusd: "1000", ratePct: "10", paymentTotal: "3", intervalDays: "30", graceDays: "7", account: SHOP, access: { ok: true } };
+  const ep = S.apply(st, { ...base, path: "cover-only", deskFile: "id + lease" }); assert(!("path" in ep) && !("deskFile" in ep)); assert.deepEqual(ep.escrow, { condition: null, records: [] });
+  assert(!S.loanSetEscrowGate(ep).ok, "no escrow, no LoanSet"); S.recordCondition(st, ep.id, COND); S.recordCondition(st, "first", COND.toLowerCase()); assert.equal(st.pools[0].escrow.condition, COND);
   assert.throws(() => S.recordCondition(st, "first", "A0258020"), /Condition/);
   S.recordEscrow(st, "first", { owner: SHOP, seq: 9 }); assert.throws(() => S.recordEscrow(st, "first", { owner: SHOP, seq: 9 }), /already/);
-  ok("LoanSet gate: blocked without a verified escrow, under 150%, without a market or past the app deadline; cover-only cap 1,000 + desk file"); }
+  ok("LoanSet gate: blocked without a verified escrow, under 150%, without a market or past the app deadline; every loan needs the escrow"); }
 
 // Sale steps derived from ledger reads
 { const now = 100; let s = S.saleSteps({ now }); assert.deepEqual(s.steps.map((x) => x.status), ["not started", "not started", "not started", "not started"]);

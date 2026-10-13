@@ -1,6 +1,6 @@
 // Read-only ledger reads: QAK issuer/balances (mainnet), amendment status via the `feature` RPC (per network),
 // and Vault/LoanBroker/Loan entries by id. No transactions are built or sent here.
-import { QAK_ISSUER, QAK_CURRENCY, LEDGER_RPC, NETWORKS, AMENDMENTS, RIPPLE_EPOCH, MARKETS, FLAGS as TXF } from "./config.js";
+import { QAK_ISSUER, QAK_CURRENCY, LEDGER_RPC, NETWORKS, AMENDMENTS, RIPPLE_EPOCH, MARKETS, FLAGS as TXF, ACCESS } from "./config.js";
 import * as S from "./state.js";
 export { RIPPLE_EPOCH };
 export const BLACKHOLES = ["rrrrrrrrrrrrrrrrrrrrrhoLvTp","rrrrrrrrrrrrrrrrrrrrBZbvji","rrrrrrrrrrrrrrrrrrrn5RM1rHd","rrrrrrrrrrrrrrrrrNAMEtxvNvQ"];
@@ -117,7 +117,7 @@ const vaultLossOf = (meta) => { for (const n of meta?.AffectedNodes || []) { con
 // batch = the outer XLS-56 Batch hash when the tx was an inner tx (metadata ParentBatchID), else null.
 const txRow = (x) => { const tx = x.tx_json || x.tx || {}; return { tx, meta: x.meta, hash: x.hash || tx.hash, ledger: Number(x.ledger_index ?? tx.ledger_index), txIndex: Number(x.meta?.TransactionIndex ?? 0), batch: x.meta?.ParentBatchID || null }; };
 // History of `account` newest first, paged with markers, back to the transaction that created `LoanID` (its LoanSet) or to `minLedger`.
-// Never only the latest page: idempotency checks (leftover payouts, shop funding) must see every payment since the loan started.
+// Never only the latest page: idempotency checks (leftover payouts, borrower funding) must see every payment since the loan started.
 export async function accountTxSince(net, account, { LoanID = null, minLedger = -1, max = 20000 } = {}, f = globalThis.fetch) {
   const out = []; let marker;
   const createsLoan = (x) => LoanID && x.tx.TransactionType === "LoanSet" && (x.meta?.AffectedNodes || []).some((n) => n.CreatedNode?.LedgerEntryType === "Loan" && n.CreatedNode.LedgerIndex === LoanID);
@@ -136,10 +136,23 @@ export async function accountTxAll(net, account, f = globalThis.fetch, max = 500
     out.push(...(r.transactions || []).map(txRow)); marker = r.marker; } while (marker && out.length < max);
   return out;
 }
+// Lifetime access: page the borrower's mainnet account_tx newest first (markers) until a qualifying payment to ACCESS.ADDRESS is found,
+// the history ends, or ACCESS.MAX_TXS rows were read (then `complete` is false: the check could not see the whole history).
+export async function accessStatus(account, f = globalThis.fetch, { max = ACCESS.MAX_TXS } = {}) {
+  let marker, seen = 0;
+  for (;;) {
+    const r = await rpc("account_tx", { account, ledger_index_min: -1, ledger_index_max: -1, limit: 400, forward: false, ...(marker ? { marker } : {}) }, f, rpcUrl(ACCESS.NETWORK));
+    const rows = (r.transactions || []).map((x) => ({ ...txRow(x), validated: x.validated })); seen += rows.length;
+    const a = S.accessFrom(rows, account); if (a.ok) return { ...a, account, seen, complete: true };
+    if (!r.marker) return { ...a, account, seen, complete: true };
+    if (seen >= max) return { ok: false, account, seen, complete: false, reason: `Not found in the newest ${seen.toLocaleString("en-US")} transactions; the rest of the history was not read.` };
+    marker = r.marker;
+  }
+}
 // Memo the bot puts on each leftover Payment, so the app can find them: MemoType "duckbank/leftover", MemoData = the LoanID.
 const hex = (t) => Array.from(new TextEncoder().encode(t)).map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
 export const leftoverMemo = (LoanID) => ({ Memo: { MemoType: hex("duckbank/leftover"), MemoData: hex(LoanID) } });
-// Shop funding for its presigned LoanPay: MemoType "duckbank/fund", MemoData = "<LoanID>:<hash of the presigned LoanPay blob>".
+// Borrower funding for its presigned LoanPay: MemoType "duckbank/fund", MemoData = "<LoanID>:<hash of the presigned LoanPay blob>".
 export const fundMemo = (LoanID, blobHash) => ({ Memo: { MemoType: hex("duckbank/fund"), MemoData: hex(`${LoanID}:${blobHash}`) } });
 export const fundOf = (tx, LoanID) => { for (const m of tx.Memos || []) { if (m.Memo?.MemoType !== hex("duckbank/fund")) continue; const d = new TextDecoder().decode(Uint8Array.from((m.Memo.MemoData || "").match(/../g) || [], (b) => parseInt(b, 16))); const [id, h] = d.split(":"); if (id === LoanID && /^[0-9A-F]{64}$/.test(h || "")) return h; } return null; };
 const isLeftoverPay = (tx, LoanID) => (tx.Memos || []).some((m) => m.Memo?.MemoType === hex("duckbank/leftover") && m.Memo?.MemoData === hex(LoanID));
@@ -166,7 +179,7 @@ export async function hasLine(net, account, asset, f = globalThis.fetch) {
   try { const r = await rpc("account_lines", { account, peer: asset.issuer, ledger_index: "validated" }, f, rpcUrl(net)); return (r.lines || []).some((l) => l.currency === asset.currency); }
   catch (e) { if (/actNotFound/.test(e.message)) return false; throw e; }
 }
-// Everything saleSteps() needs, read from the ledger: Loan, the broker's LoanManage/EscrowFinish/OfferCreate/Payment, the shop's LoanPay
+// Everything saleSteps() needs, read from the ledger: Loan, the broker's LoanManage/EscrowFinish/OfferCreate/Payment, the borrower's LoanPay
 // and escrow cancels. `escrows` = [{owner, seq}] on record. Only validated tesSUCCESS transactions count.
 export async function saleInputs(net, { LoanID, broker, shop, escrows, quote, minLedger = -1 }, f = globalThis.fetch) {
   const loan = await ledgerEntry(net, LoanID, f).catch((e) => { if (/entryNotFound|objectNotFound/.test(e.message)) return null; throw e; });
@@ -190,7 +203,7 @@ export async function saleInputs(net, { LoanID, broker, shop, escrows, quote, mi
   const sales = firstFin == null ? [] : txs.filter((x) => x.tx.Account === broker && ["OfferCreate", "Payment"].includes(x.tx.TransactionType) && x.tx.date >= firstFin)
     .map((x) => ({ hash: x.hash, batch: x.batch, xrpDrops: -(balanceDelta(x.meta, broker, "XRP") + (x.tx.Delegate ? 0 : Number(x.tx.Fee))), quote: balanceDelta(x.meta, broker, quote) }))
     .filter((x) => x.xrpDrops > 0 && x.quote > 0);
-  // Broker Payments of the vault asset to the shop after the first finish (funding the shop's own LoanPay), with their batch if any.
+  // Broker Payments of the vault asset to the borrower after the first finish (funding the borrower's own LoanPay), with their batch if any.
   const shopPays = firstFin == null ? [] : txs.filter((x) => x.tx.Account === broker && x.tx.TransactionType === "Payment" && x.tx.Destination === shop && x.tx.date >= firstFin && !isLeftoverPay(x.tx, LoanID))
     .map((x) => ({ hash: x.hash, batch: x.batch, quote: -balanceDelta(x.meta, broker, quote) })).filter((x) => x.quote > 0);
   const pays = markDate == null ? [] : txs.filter((x) => x.tx.TransactionType === "LoanPay" && x.tx.LoanID === LoanID && x.tx.date >= markDate)
